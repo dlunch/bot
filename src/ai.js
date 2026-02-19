@@ -215,7 +215,7 @@ export async function createAiResponse(context, options = {}) {
   };
 
   if (webSearch) {
-    body.tools = [{ type: "web_search_preview" }];
+    body.tools = [{ type: "web_search" }];
   }
 
   const headers = {
