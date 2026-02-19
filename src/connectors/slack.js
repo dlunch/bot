@@ -300,7 +300,7 @@ export async function startSlackBot(config, options) {
       ts: event.ts
     });
 
-    if (event.subtype) {
+    if (event.subtype && event.subtype !== "thread_broadcast") {
       return;
     }
 
