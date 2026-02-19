@@ -1,14 +1,34 @@
-import dotenv from "dotenv";
+import fs from "node:fs/promises";
+import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { createAiResponse, getAiConfig, getSystemPromptInfo } from "./ai.js";
 
-dotenv.config();
-
 const rl = readline.createInterface({ input, output });
 const history = [];
-const { model, codexAuthFile } = getAiConfig();
+const servicesFile = path.join(process.cwd(), "config", "services.json");
+const { codexAuthFile } = getAiConfig();
 const promptInfo = await getSystemPromptInfo();
+
+async function loadCliModel() {
+  const content = await fs.readFile(servicesFile, "utf8");
+  const parsed = JSON.parse(content);
+  const slackModel = parsed?.slack?.find((entry) => typeof entry?.model === "string" && entry.model.trim())?.model;
+  if (slackModel) {
+    return slackModel.trim();
+  }
+
+  const discordModel = parsed?.discord?.find(
+    (entry) => typeof entry?.model === "string" && entry.model.trim()
+  )?.model;
+  if (discordModel) {
+    return discordModel.trim();
+  }
+
+  throw new Error("No model found in config/services.json");
+}
+
+const model = await loadCliModel();
 
 console.log("[cli] Codex chat test interface");
 console.log(`[cli] model=${model}`);
@@ -43,6 +63,7 @@ while (true) {
     let started = false;
     const answer =
       (await createAiResponse(history, {
+        model,
         onDelta: (delta) => {
           if (!delta) {
             return;

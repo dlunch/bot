@@ -1,18 +1,15 @@
-# Slack + Codex Auth 챗봇
+# Slack + Discord + Codex Auth 챗봇
 
-Slack 스레드 챗봇입니다.
+한 프로세스에서 여러 Slack/Discord 봇을 동시에 실행합니다.
 
-- 첫 메시지는 `@bot 질문`으로 시작
-- 이후 같은 스레드에서는 멘션 없이 계속 대화
+- Slack: 멘션/스레드/DM 대응
+- Discord: 멘션/DM 대응
 - AI 호출 인증은 `codex auth` 토큰만 사용 (`~/.codex/auth.json`)
 
 ## 1) 로컬 CLI로 먼저 테스트
 
-Slack 설치 전에 터미널에서 대화 품질부터 확인할 수 있습니다.
-
 ```bash
 codex auth login
-cp .env.example .env
 npm install
 npm run chat
 ```
@@ -22,7 +19,34 @@ CLI 명령:
 - `/reset`: 문맥 초기화
 - `/exit`: 종료
 
-## 2) Slack App 준비
+## 2) 서비스 설정 파일
+
+기본 경로: `config/services.json`
+
+```json
+{
+  "slack": [
+    {
+      "name": "main",
+      "botToken": "xoxb-your-bot-token",
+      "appToken": "xapp-your-app-level-token",
+      "model": "gpt-5.3-codex"
+    }
+  ],
+  "discord": [
+    {
+      "name": "main",
+      "botToken": "your-discord-bot-token",
+      "model": "gpt-5.3-codex"
+    }
+  ]
+}
+```
+
+`config/services.example.json` 예시 파일도 함께 제공합니다.
+각 서비스 항목의 `model`은 필수입니다.
+
+## 3) Slack App 준비
 
 - OAuth Scopes (Bot Token Scopes)
   - `app_mentions:read`
@@ -37,22 +61,14 @@ CLI 명령:
 - Socket Mode
   - App-Level Token 발급 (`connections:write`)
 
-## 3) 환경변수 설정
+## 4) Discord Bot 준비
 
-```bash
-cp .env.example .env
-```
+- Bot 계정 생성 후 토큰 발급
+- Privileged Gateway Intents:
+  - `MESSAGE CONTENT` 활성화
+- OAuth2에서 봇을 서버에 초대
 
-`.env` 값:
-
-- `SLACK_BOT_TOKEN`: `xoxb-...`
-- `SLACK_APP_TOKEN`: `xapp-...`
-- (선택) `CODEX_MODEL` 기본값: `gpt-5`
-- (선택) `CODEX_AUTH_FILE` 기본값: `~/.codex/auth.json`
-- (선택) `BOT_CONFIG_FILE` 기본값: `./config/bot.config.json`
-- (선택) `MAX_THREAD_HISTORY` 기본값: `20`
-
-## 4) 시스템 프롬프트 설정 파일
+## 5) 시스템 프롬프트 설정 파일
 
 `config/bot.config.json`의 `systemPrompt`를 수정하면 반영됩니다.
 
@@ -62,7 +78,7 @@ cp .env.example .env
 }
 ```
 
-## 5) Slack 봇 실행
+## 6) 실행
 
 ```bash
 npm run start
@@ -70,7 +86,11 @@ npm run start
 
 ## 파일 구조
 
-- `src/index.js`: Slack 이벤트 처리
+- `src/index.js`: 멀티 서비스 런처
+- `src/connectors/slack.js`: Slack 연결
+- `src/connectors/discord.js`: Discord 연결
 - `src/ai.js`: Codex auth 기반 AI 호출
 - `src/cli.js`: 로컬 테스트 CLI
+- `config/services.json`: 서비스 구성
+- `config/services.example.json`: 서비스 구성 예시
 - `config/bot.config.json`: 시스템 프롬프트 설정

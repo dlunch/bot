@@ -6,6 +6,7 @@ config/bot.config.json
 .env
 .env.*
 !.env.example
+config/services.json
 
 # logs
 npm-debug.log*

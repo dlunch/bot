@@ -1,4 +1,3 @@
-import "dotenv/config";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,21 +7,14 @@ const codexAuthFile =
   process.env.CODEX_AUTH_FILE || path.join(os.homedir(), ".codex", "auth.json");
 const botConfigFile =
   process.env.BOT_CONFIG_FILE || path.join(process.cwd(), "config", "bot.config.json");
-const rawModel = (process.env.CODEX_MODEL || process.env.OPENAI_MODEL || "").trim();
 
 function normalizeModelName(name) {
-  if (!name) {
-    return "gpt-5";
-  }
-
   if (name === "5.3-codex") {
     return "gpt-5.3-codex";
   }
 
   return name;
 }
-
-const model = normalizeModelName(rawModel);
 const defaultSystemPrompt =
   "You are a concise and helpful Slack assistant. Continue the conversation naturally using the thread context.";
 
@@ -206,11 +198,16 @@ async function parseSseStream(stream, onDelta) {
 }
 
 export async function createAiResponse(context, options = {}) {
-  const { onDelta } = options;
+  const { onDelta, model: requestedModel } = options;
+  if (typeof requestedModel !== "string" || !requestedModel.trim()) {
+    throw new Error("model is required for createAiResponse");
+  }
+
   const { accessToken, accountId } = await readCodexAuth();
   const botConfig = await readBotConfig();
+  const effectiveModel = normalizeModelName(requestedModel.trim());
   const body = {
-    model,
+    model: effectiveModel,
     instructions: botConfig.systemPrompt,
     input: toResponsesInput(context),
     store: false,
@@ -270,7 +267,6 @@ export async function createAiResponse(context, options = {}) {
 export function getAiConfig() {
   return {
     authMode: "codex",
-    model,
     codexAuthFile,
     botConfigFile
   };

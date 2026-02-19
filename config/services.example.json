@@ -1,0 +1,17 @@
+{
+  "slack": [
+    {
+      "name": "main",
+      "botToken": "xoxb-your-bot-token",
+      "appToken": "xapp-your-app-level-token",
+      "model": "gpt-5.3-codex"
+    }
+  ],
+  "discord": [
+    {
+      "name": "main",
+      "botToken": "your-discord-bot-token",
+      "model": "gpt-5.3-codex"
+    }
+  ]
+}
