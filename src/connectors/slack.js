@@ -202,6 +202,7 @@ export async function startSlackBot(config, options) {
       const answer =
         (await createAiResponse(context, {
           model: config.model,
+          webSearch: config.webSearch,
           onDelta: async (_delta, fullText) => {
             streamedText = fullText;
             if (!replyTs && streamedText.trim()) {
@@ -339,6 +340,6 @@ export async function startSlackBot(config, options) {
   botUserId = auth.user_id || null;
   await app.start();
   console.log(
-    `[slack] started name=${config.name} bot_user=${botUserId} model=${config.model || "default"} system_prompt_source=${systemPromptInfo.source}`
+    `[slack] started name=${config.name} bot_user=${botUserId} model=${config.model || "default"} web_search=${config.webSearch} system_prompt_source=${systemPromptInfo.source}`
   );
 }

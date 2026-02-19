@@ -18,13 +18,15 @@ async function loadServicesConfig() {
     name: entry.name || "slack",
     botToken: entry.botToken,
     appToken: entry.appToken,
-    model: entry.model
+    model: entry.model,
+    webSearch: Boolean(entry.webSearch)
   }));
 
   const discord = (parsed.discord || []).map((entry) => ({
     name: entry.name || "discord",
     botToken: entry.botToken,
-    model: entry.model
+    model: entry.model,
+    webSearch: Boolean(entry.webSearch)
   }));
 
   return { slack, discord };

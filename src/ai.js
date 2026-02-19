@@ -198,7 +198,7 @@ async function parseSseStream(stream, onDelta) {
 }
 
 export async function createAiResponse(context, options = {}) {
-  const { onDelta, model: requestedModel } = options;
+  const { onDelta, model: requestedModel, webSearch } = options;
   if (typeof requestedModel !== "string" || !requestedModel.trim()) {
     throw new Error("model is required for createAiResponse");
   }
@@ -213,6 +213,10 @@ export async function createAiResponse(context, options = {}) {
     store: false,
     stream: true
   };
+
+  if (webSearch) {
+    body.tools = [{ type: "web_search_preview" }];
+  }
 
   const headers = {
     "Content-Type": "application/json",
