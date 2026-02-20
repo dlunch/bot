@@ -176,13 +176,14 @@ export async function startSlackBot(config, options) {
           return;
         }
 
-        await client.chat.update({
-          channel: event.channel,
-          ts: replyTs,
-          text: toSlackText(text)
-        });
-        lastUpdateAt = now;
-      };
+      await client.chat.update({
+        channel: event.channel,
+        ts: replyTs,
+        text: toSlackText(text),
+        mrkdwn: true
+      });
+      lastUpdateAt = now;
+    };
 
       const scheduleUpdate = () => {
         if (pendingUpdate) {
@@ -208,7 +209,8 @@ export async function startSlackBot(config, options) {
               const reply = await client.chat.postMessage({
                 channel: event.channel,
                 ...(inDm ? {} : { thread_ts: threadTs }),
-                text: toSlackText(streamedText)
+                text: toSlackText(streamedText),
+                mrkdwn: true
               });
               replyTs = reply.ts;
               lastUpdateAt = Date.now();
@@ -235,7 +237,8 @@ export async function startSlackBot(config, options) {
         const reply = await client.chat.postMessage({
           channel: event.channel,
           ...(inDm ? {} : { thread_ts: threadTs }),
-          text: toSlackText(finalText)
+          text: toSlackText(finalText),
+          mrkdwn: true
         });
         replyTs = reply.ts;
       }
@@ -246,7 +249,8 @@ export async function startSlackBot(config, options) {
         await client.chat.update({
           channel: event.channel,
           ts: replyTs,
-          text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요."
+          text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
+          mrkdwn: true
         });
         return;
       }
@@ -254,12 +258,17 @@ export async function startSlackBot(config, options) {
       if (inDm) {
         await client.chat.postMessage({
           channel: event.channel,
-          text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요."
+          text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
+          mrkdwn: true
         });
         return;
       }
 
-      await say({ text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.", thread_ts: threadTs });
+      await say({
+        text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
+        thread_ts: threadTs,
+        mrkdwn: true
+      });
     } finally {
       if (pendingUpdate) {
         clearTimeout(pendingUpdate);
