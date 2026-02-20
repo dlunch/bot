@@ -178,14 +178,14 @@ export async function startSlackBot(config, options) {
           return;
         }
 
-      await client.chat.update({
-        channel: event.channel,
-        ts: replyTs,
-        text: toSlackText(text),
-        mrkdwn: true
-      });
-      lastUpdateAt = now;
-    };
+        await client.chat.update({
+          channel: event.channel,
+          ts: replyTs,
+          text: toSlackText(text),
+          parse: "none"
+        });
+        lastUpdateAt = now;
+      };
 
       const scheduleUpdate = () => {
         if (pendingUpdate) {
@@ -213,6 +213,7 @@ export async function startSlackBot(config, options) {
                 channel: event.channel,
                 ...(inDm ? {} : { thread_ts: threadTs }),
                 text: toSlackText(streamedText),
+                parse: "none",
                 mrkdwn: true
               });
               replyTs = reply.ts;
@@ -241,6 +242,7 @@ export async function startSlackBot(config, options) {
           channel: event.channel,
           ...(inDm ? {} : { thread_ts: threadTs }),
           text: toSlackText(finalText),
+          parse: "none",
           mrkdwn: true
         });
         replyTs = reply.ts;
@@ -253,7 +255,7 @@ export async function startSlackBot(config, options) {
           channel: event.channel,
           ts: replyTs,
           text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
-          mrkdwn: true
+          parse: "none"
         });
         return;
       }
@@ -262,6 +264,7 @@ export async function startSlackBot(config, options) {
         await client.chat.postMessage({
           channel: event.channel,
           text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
+          parse: "none",
           mrkdwn: true
         });
         return;
@@ -270,6 +273,7 @@ export async function startSlackBot(config, options) {
       await say({
         text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
         thread_ts: threadTs,
+        parse: "none",
         mrkdwn: true
       });
     } finally {
