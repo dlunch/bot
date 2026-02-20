@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: slack-openai-bot
+  repository: ghcr.io/dlunch/bot
   pullPolicy: IfNotPresent
   tag: ""
 
@@ -55,4 +55,3 @@ config:
 
   botConfig:
     systemPrompt: "You are a concise and helpful Slack assistant. Continue the conversation naturally using the thread context."
-
