@@ -4,13 +4,15 @@
 
 - Slack: 멘션/스레드/DM 대응
 - Discord: 멘션/DM 대응
-- AI 호출 인증은 `codex auth` 토큰만 사용 (`~/.codex/auth.json`)
+- AI 호출 인증은 환경변수만 사용 (`CODEX_ACCESS_TOKEN`, 선택: `CODEX_ACCOUNT_ID`)
 
 ## 1) 로컬 CLI로 먼저 테스트
 
 ```bash
-codex auth login
 npm install
+export CODEX_ACCESS_TOKEN=your_codex_access_token
+# optional
+export CODEX_ACCOUNT_ID=your_codex_account_id
 npm run chat
 ```
 
@@ -81,8 +83,36 @@ CLI 명령:
 ## 6) 실행
 
 ```bash
+export CODEX_ACCESS_TOKEN=your_codex_access_token
+# optional
+export CODEX_ACCOUNT_ID=your_codex_account_id
 npm run start
 ```
+
+## 7) Docker 빌드/실행
+
+```bash
+docker build -t slack-openai-bot .
+docker run --rm \
+  -e CODEX_ACCESS_TOKEN=your_codex_access_token \
+  -e CODEX_ACCOUNT_ID=your_codex_account_id \
+  -v "$(pwd)/config/services.json:/app/config/services.json:ro" \
+  -v "$(pwd)/config/bot.config.json:/app/config/bot.config.json:ro" \
+  slack-openai-bot
+```
+
+## 8) Helm 배포
+
+차트 경로: `helm/slack-openai-bot`
+
+```bash
+helm upgrade --install bot ./helm/slack-openai-bot \
+  --set image.repository=your-repo/slack-openai-bot \
+  --set image.tag=latest \
+  --set auth.accessToken=your_codex_access_token
+```
+
+민감정보 관리를 위해 `auth.existingSecret`, `config.servicesExistingSecret` 사용을 권장합니다.
 
 ## 파일 구조
 
@@ -91,6 +121,8 @@ npm run start
 - `src/connectors/discord.js`: Discord 연결
 - `src/ai.js`: Codex auth 기반 AI 호출
 - `src/cli.js`: 로컬 테스트 CLI
+- `Dockerfile`: 컨테이너 이미지 빌드
+- `helm/slack-openai-bot`: Kubernetes Helm 차트
 - `config/services.json`: 서비스 구성
 - `config/services.example.json`: 서비스 구성 예시
 - `config/bot.config.json`: 시스템 프롬프트 설정

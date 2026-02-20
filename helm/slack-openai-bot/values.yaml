@@ -1,0 +1,58 @@
+replicaCount: 1
+
+image:
+  repository: slack-openai-bot
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+resources: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+env:
+  maxThreadHistory: 20
+  slackStreamUpdateMs: 800
+  discordStreamUpdateMs: 800
+
+auth:
+  # Set this to use a pre-created secret instead of chart-managed one.
+  # The secret keys must be: CODEX_ACCESS_TOKEN, optional CODEX_ACCOUNT_ID.
+  existingSecret: ""
+  accessToken: ""
+  accountId: ""
+
+config:
+  # Set this to use a pre-created secret containing services.json.
+  servicesExistingSecret: ""
+  # Set this to use a pre-created configmap containing bot.config.json.
+  botConfigExistingConfigMap: ""
+
+  services:
+    slack: []
+    discord: []
+
+  botConfig:
+    systemPrompt: "You are a concise and helpful Slack assistant. Continue the conversation naturally using the thread context."
+

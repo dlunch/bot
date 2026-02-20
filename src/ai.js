@@ -1,10 +1,7 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 
 const codexEndpoint = "https://chatgpt.com/backend-api/codex/responses";
-const codexAuthFile =
-  process.env.CODEX_AUTH_FILE || path.join(os.homedir(), ".codex", "auth.json");
 const botConfigFile =
   process.env.BOT_CONFIG_FILE || path.join(process.cwd(), "config", "bot.config.json");
 
@@ -18,14 +15,12 @@ function normalizeModelName(name) {
 const defaultSystemPrompt =
   "You are a concise and helpful Slack assistant. Continue the conversation naturally using the thread context.";
 
-async function readCodexAuth() {
-  const content = await fs.readFile(codexAuthFile, "utf8");
-  const parsed = JSON.parse(content);
-  const accessToken = parsed?.tokens?.access_token;
-  const accountId = parsed?.tokens?.account_id || undefined;
+function readCodexAuthFromEnv() {
+  const accessToken = process.env.CODEX_ACCESS_TOKEN?.trim();
+  const accountId = process.env.CODEX_ACCOUNT_ID?.trim() || undefined;
 
   if (!accessToken) {
-    throw new Error("codex auth token not found. Run: codex auth login");
+    throw new Error("CODEX_ACCESS_TOKEN is required");
   }
 
   return { accessToken, accountId };
@@ -203,7 +198,7 @@ export async function createAiResponse(context, options = {}) {
     throw new Error("model is required for createAiResponse");
   }
 
-  const { accessToken, accountId } = await readCodexAuth();
+  const { accessToken, accountId } = readCodexAuthFromEnv();
   const botConfig = await readBotConfig();
   const effectiveModel = normalizeModelName(requestedModel.trim());
   const body = {
@@ -266,8 +261,9 @@ export async function createAiResponse(context, options = {}) {
 
 export function getAiConfig() {
   return {
-    authMode: "codex",
-    codexAuthFile,
+    authMode: "codex_env",
+    codexAuthSource: "env",
+    hasAccountId: Boolean(process.env.CODEX_ACCOUNT_ID?.trim()),
     botConfigFile
   };
 }

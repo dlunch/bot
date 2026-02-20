@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "slack-openai-bot.fullname" . }}
+  labels:
+    {{- include "slack-openai-bot.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "slack-openai-bot.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "slack-openai-bot.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: bot
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: CODEX_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "slack-openai-bot.authSecretName" . }}
+                  key: CODEX_ACCESS_TOKEN
+            - name: CODEX_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "slack-openai-bot.authSecretName" . }}
+                  key: CODEX_ACCOUNT_ID
+                  optional: true
+            - name: MAX_THREAD_HISTORY
+              value: {{ .Values.env.maxThreadHistory | quote }}
+            - name: SLACK_STREAM_UPDATE_MS
+              value: {{ .Values.env.slackStreamUpdateMs | quote }}
+            - name: DISCORD_STREAM_UPDATE_MS
+              value: {{ .Values.env.discordStreamUpdateMs | quote }}
+            - name: BOT_CONFIG_FILE
+              value: /app/config/bot.config.json
+          volumeMounts:
+            - name: services-config
+              mountPath: /app/config/services.json
+              subPath: services.json
+              readOnly: true
+            - name: bot-config
+              mountPath: /app/config/bot.config.json
+              subPath: bot.config.json
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: services-config
+          secret:
+            secretName: {{ include "slack-openai-bot.servicesSecretName" . }}
+        - name: bot-config
+          configMap:
+            name: {{ include "slack-openai-bot.botConfigMapName" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+

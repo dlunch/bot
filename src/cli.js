@@ -7,7 +7,7 @@ import { createAiResponse, getAiConfig, getSystemPromptInfo } from "./ai.js";
 const rl = readline.createInterface({ input, output });
 const history = [];
 const servicesFile = path.join(process.cwd(), "config", "services.json");
-const { codexAuthFile } = getAiConfig();
+const aiConfig = getAiConfig();
 const promptInfo = await getSystemPromptInfo();
 
 async function loadCliModel() {
@@ -32,7 +32,8 @@ const model = await loadCliModel();
 
 console.log("[cli] Codex chat test interface");
 console.log(`[cli] model=${model}`);
-console.log(`[cli] auth_file=${codexAuthFile}`);
+console.log(`[cli] auth_source=${aiConfig.codexAuthSource}`);
+console.log(`[cli] auth_has_account_id=${aiConfig.hasAccountId}`);
 console.log(
   `[cli] system_prompt source=${promptInfo.source} file=${promptInfo.file} length=${promptInfo.length}`
 );
