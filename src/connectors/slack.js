@@ -1,5 +1,7 @@
-import { App, SocketModeReceiver } from "@slack/bolt";
+import SlackBolt from "@slack/bolt";
 import { createAiResponse } from "../ai.js";
+
+const { App, SocketModeReceiver } = SlackBolt;
 
 export async function startSlackBot(config, options) {
   const { systemPromptInfo, maxThreadHistory, slackStreamUpdateMs } = options;
