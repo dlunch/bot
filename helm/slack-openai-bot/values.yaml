@@ -46,12 +46,8 @@ auth:
 config:
   # Set this to use a pre-created secret containing services.json.
   servicesExistingSecret: ""
-  # Set this to use a pre-created configmap containing bot.config.json.
-  botConfigExistingConfigMap: ""
 
   services:
     slack: []
     discord: []
-
-  botConfig:
-    systemPrompt: "You are a concise and helpful Slack assistant. Continue the conversation naturally using the thread context."
+    irc: []

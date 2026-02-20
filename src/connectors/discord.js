@@ -2,7 +2,7 @@ import { Client, GatewayIntentBits, Partials } from "discord.js";
 import { createAiResponse } from "../ai.js";
 
 export async function startDiscordBot(config, options) {
-  const { systemPromptInfo, maxThreadHistory, discordStreamUpdateMs } = options;
+  const { maxThreadHistory, discordStreamUpdateMs } = options;
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
@@ -112,6 +112,7 @@ export async function startDiscordBot(config, options) {
         (await createAiResponse(context, {
           model: config.model,
           webSearch: config.webSearch,
+          systemPrompt: config.systemPrompt,
           onDelta: async (_delta, fullText) => {
             streamedText = fullText;
             if (!replyMessage && streamedText.trim()) {
@@ -172,7 +173,7 @@ export async function startDiscordBot(config, options) {
 
   await client.login(config.botToken);
   console.log(
-    `[discord] started name=${config.name} bot_user=${client.user?.id} model=${config.model || "default"} web_search=${config.webSearch} system_prompt_source=${systemPromptInfo.source}`
+    `[discord] started name=${config.name} bot_user=${client.user?.id} model=${config.model || "default"} web_search=${config.webSearch} system_prompt=${config.systemPrompt ? "service" : "default"}`
   );
 
   return {

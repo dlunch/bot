@@ -5,6 +5,7 @@
       "botToken": "xoxb-your-bot-token",
       "appToken": "xapp-your-app-level-token",
       "model": "gpt-5.3-codex",
+      "systemPrompt": "You are a helpful Slack assistant.",
       "webSearch": false
     }
   ],
@@ -13,6 +14,28 @@
       "name": "main",
       "botToken": "your-discord-bot-token",
       "model": "gpt-5.3-codex",
+      "systemPrompt": "You are a helpful Discord assistant.",
+      "webSearch": false
+    }
+  ],
+  "irc": [
+    {
+      "name": "libera",
+      "server": "irc.libera.chat",
+      "port": 6697,
+      "ssl": true,
+      "nick": "codexbot",
+      "username": "codexbot",
+      "realname": "Codex Bot",
+      "channels": ["#your-channel"],
+      "sasl": {
+        "enabled": true,
+        "mechanism": "PLAIN",
+        "username": "codexbot",
+        "password": "your-sasl-password"
+      },
+      "model": "gpt-5.3-codex",
+      "systemPrompt": "You are a helpful IRC assistant.",
       "webSearch": false
     }
   ]

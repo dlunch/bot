@@ -1,9 +1,4 @@
-import fs from "node:fs/promises";
-import path from "node:path";
-
 const codexEndpoint = "https://chatgpt.com/backend-api/codex/responses";
-const botConfigFile =
-  process.env.BOT_CONFIG_FILE || path.join(process.cwd(), "config", "bot.config.json");
 
 function normalizeModelName(name) {
   if (name === "5.3-codex") {
@@ -13,7 +8,7 @@ function normalizeModelName(name) {
   return name;
 }
 const defaultSystemPrompt =
-  "You are a concise and helpful Slack assistant. Continue the conversation naturally using the thread context.";
+  "You are a concise and helpful assistant. Continue the conversation naturally using the context.";
 
 function readCodexAuthFromEnv() {
   const accessToken = process.env.CODEX_ACCESS_TOKEN?.trim();
@@ -24,21 +19,6 @@ function readCodexAuthFromEnv() {
   }
 
   return { accessToken, accountId };
-}
-
-async function readBotConfig() {
-  try {
-    const content = await fs.readFile(botConfigFile, "utf8");
-    const parsed = JSON.parse(content);
-
-    if (typeof parsed?.systemPrompt === "string" && parsed.systemPrompt.trim()) {
-      return { systemPrompt: parsed.systemPrompt.trim(), source: "file" };
-    }
-  } catch (_error) {
-    // Fallback to default prompt when config file is absent or invalid.
-  }
-
-  return { systemPrompt: defaultSystemPrompt, source: "default" };
 }
 
 function toResponsesInput(messages) {
@@ -199,11 +179,14 @@ export async function createAiResponse(context, options = {}) {
   }
 
   const { accessToken, accountId } = readCodexAuthFromEnv();
-  const botConfig = await readBotConfig();
+  const systemPrompt =
+    typeof options.systemPrompt === "string" && options.systemPrompt.trim()
+      ? options.systemPrompt.trim()
+      : defaultSystemPrompt;
   const effectiveModel = normalizeModelName(requestedModel.trim());
   const body = {
     model: effectiveModel,
-    instructions: botConfig.systemPrompt,
+    instructions: systemPrompt,
     input: toResponsesInput(context),
     store: false,
     stream: true
@@ -267,37 +250,6 @@ export function getAiConfig() {
   return {
     authMode: "codex_env",
     codexAuthSource: "env",
-    hasAccountId: Boolean(process.env.CODEX_ACCOUNT_ID?.trim()),
-    botConfigFile
-  };
-}
-
-export async function getSystemPromptInfo() {
-  const config = await readBotConfig();
-  const fullPrompt = config.systemPrompt;
-  const preview = config.systemPrompt.replace(/\s+/g, " ").trim().slice(0, 120);
-  const previewEscaped = preview
-    .split("")
-    .map((char) => {
-      const code = char.codePointAt(0);
-      if (typeof code !== "number") {
-        return char;
-      }
-
-      if (code < 128) {
-        return char;
-      }
-
-      return `\\u${code.toString(16).padStart(4, "0")}`;
-    })
-    .join("");
-
-  return {
-    source: config.source,
-    file: botConfigFile,
-    length: config.systemPrompt.length,
-    fullPrompt,
-    preview,
-    previewEscaped
+    hasAccountId: Boolean(process.env.CODEX_ACCOUNT_ID?.trim())
   };
 }

@@ -47,12 +47,3 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-services" (include "slack-openai-bot.fullname" .) -}}
 {{- end -}}
 {{- end -}}
-
-{{- define "slack-openai-bot.botConfigMapName" -}}
-{{- if .Values.config.botConfigExistingConfigMap -}}
-{{- .Values.config.botConfigExistingConfigMap -}}
-{{- else -}}
-{{- printf "%s-bot-config" (include "slack-openai-bot.fullname" .) -}}
-{{- end -}}
-{{- end -}}
-

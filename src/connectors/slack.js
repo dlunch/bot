@@ -4,7 +4,7 @@ import { createAiResponse } from "../ai.js";
 const { App, SocketModeReceiver } = SlackBolt;
 
 export async function startSlackBot(config, options) {
-  const { systemPromptInfo, maxThreadHistory, slackStreamUpdateMs } = options;
+  const { maxThreadHistory, slackStreamUpdateMs } = options;
   const receiver = new SocketModeReceiver({
     appToken: config.appToken
   });
@@ -207,6 +207,7 @@ export async function startSlackBot(config, options) {
         (await createAiResponse(context, {
           model: config.model,
           webSearch: config.webSearch,
+          systemPrompt: config.systemPrompt,
           onDelta: async (_delta, fullText) => {
             streamedText = fullText;
             if (!replyTs && streamedText.trim()) {
@@ -357,7 +358,7 @@ export async function startSlackBot(config, options) {
   botUserId = auth.user_id || null;
   await app.start();
   console.log(
-    `[slack] started name=${config.name} bot_user=${botUserId} model=${config.model || "default"} web_search=${config.webSearch} system_prompt_source=${systemPromptInfo.source}`
+    `[slack] started name=${config.name} bot_user=${botUserId} model=${config.model || "default"} web_search=${config.webSearch} system_prompt=${config.systemPrompt ? "service" : "default"}`
   );
 
   return {

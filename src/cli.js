@@ -2,43 +2,69 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { createAiResponse, getAiConfig, getSystemPromptInfo } from "./ai.js";
+import { createAiResponse, getAiConfig } from "./ai.js";
 
 const rl = readline.createInterface({ input, output });
 const history = [];
 const servicesFile = path.join(process.cwd(), "config", "services.json");
 const aiConfig = getAiConfig();
-const promptInfo = await getSystemPromptInfo();
 
-async function loadCliModel() {
+async function loadCliConfig() {
   const content = await fs.readFile(servicesFile, "utf8");
   const parsed = JSON.parse(content);
-  const slackModel = parsed?.slack?.find((entry) => typeof entry?.model === "string" && entry.model.trim())?.model;
-  if (slackModel) {
-    return slackModel.trim();
+  const findEntry = (entries = []) =>
+    entries.find((entry) => typeof entry?.model === "string" && entry.model.trim());
+
+  const slackEntry = findEntry(parsed?.slack || []);
+  if (slackEntry) {
+    return {
+      model: slackEntry.model.trim(),
+      systemPrompt:
+        typeof slackEntry.systemPrompt === "string" && slackEntry.systemPrompt.trim()
+          ? slackEntry.systemPrompt.trim()
+          : undefined,
+      service: "slack",
+      name: slackEntry.name || "slack"
+    };
   }
 
-  const discordModel = parsed?.discord?.find(
-    (entry) => typeof entry?.model === "string" && entry.model.trim()
-  )?.model;
-  if (discordModel) {
-    return discordModel.trim();
+  const discordEntry = findEntry(parsed?.discord || []);
+  if (discordEntry) {
+    return {
+      model: discordEntry.model.trim(),
+      systemPrompt:
+        typeof discordEntry.systemPrompt === "string" && discordEntry.systemPrompt.trim()
+          ? discordEntry.systemPrompt.trim()
+          : undefined,
+      service: "discord",
+      name: discordEntry.name || "discord"
+    };
+  }
+
+  const ircEntry = findEntry(parsed?.irc || []);
+  if (ircEntry) {
+    return {
+      model: ircEntry.model.trim(),
+      systemPrompt:
+        typeof ircEntry.systemPrompt === "string" && ircEntry.systemPrompt.trim()
+          ? ircEntry.systemPrompt.trim()
+          : undefined,
+      service: "irc",
+      name: ircEntry.name || "irc"
+    };
   }
 
   throw new Error("No model found in config/services.json");
 }
 
-const model = await loadCliModel();
+const cliConfig = await loadCliConfig();
 
 console.log("[cli] Codex chat test interface");
-console.log(`[cli] model=${model}`);
+console.log(`[cli] model=${cliConfig.model}`);
+console.log(`[cli] service=${cliConfig.service}:${cliConfig.name}`);
 console.log(`[cli] auth_source=${aiConfig.codexAuthSource}`);
 console.log(`[cli] auth_has_account_id=${aiConfig.hasAccountId}`);
-console.log(
-  `[cli] system_prompt source=${promptInfo.source} file=${promptInfo.file} length=${promptInfo.length}`
-);
-console.log("[cli] system_prompt_raw");
-console.log(promptInfo.fullPrompt);
+console.log(`[cli] system_prompt=${cliConfig.systemPrompt ? "service" : "default"}`);
 console.log("[cli] /reset to clear context, /exit to quit\n");
 
 while (true) {
@@ -64,7 +90,8 @@ while (true) {
     let started = false;
     const answer =
       (await createAiResponse(history, {
-        model,
+        model: cliConfig.model,
+        systemPrompt: cliConfig.systemPrompt,
         onDelta: (delta) => {
           if (!delta) {
             return;
