@@ -53,6 +53,50 @@ function assertDiscordConfig(config) {
 }
 
 (async () => {
+  const stopHandlers = [];
+  const shutdownTimeoutMs = Number(process.env.SHUTDOWN_TIMEOUT_MS || 10000);
+  let isShuttingDown = false;
+
+  async function shutdown(signal) {
+    if (isShuttingDown) {
+      return;
+    }
+    isShuttingDown = true;
+
+    console.log(`[server] shutdown requested signal=${signal}`);
+
+    const stopAll = Promise.allSettled(
+      [...stopHandlers].reverse().map(async (handler) => {
+        try {
+          await handler();
+        } catch (error) {
+          console.error("[server] stop handler failed", error);
+        }
+      })
+    );
+
+    const timeout = new Promise((resolve) => {
+      setTimeout(() => resolve("timeout"), shutdownTimeoutMs);
+    });
+
+    const result = await Promise.race([stopAll, timeout]);
+    if (result === "timeout") {
+      console.error(`[server] shutdown timeout after ${shutdownTimeoutMs}ms`);
+      process.exit(1);
+      return;
+    }
+
+    console.log("[server] shutdown complete");
+    process.exit(0);
+  }
+
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
+
   const ai = getAiConfig();
   const systemPromptInfo = await getSystemPromptInfo();
   console.log(
@@ -79,12 +123,18 @@ function assertDiscordConfig(config) {
 
   for (const slackConfig of slackBots) {
     assertSlackConfig(slackConfig);
-    await startSlackBot(slackConfig, commonOptions);
+    const runtime = await startSlackBot(slackConfig, commonOptions);
+    if (runtime?.stop) {
+      stopHandlers.push(() => runtime.stop());
+    }
   }
 
   for (const discordConfig of discordBots) {
     assertDiscordConfig(discordConfig);
-    await startDiscordBot(discordConfig, commonOptions);
+    const runtime = await startDiscordBot(discordConfig, commonOptions);
+    if (runtime?.stop) {
+      stopHandlers.push(() => runtime.stop());
+    }
   }
 
   console.log(

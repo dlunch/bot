@@ -174,4 +174,11 @@ export async function startDiscordBot(config, options) {
   console.log(
     `[discord] started name=${config.name} bot_user=${client.user?.id} model=${config.model || "default"} web_search=${config.webSearch} system_prompt_source=${systemPromptInfo.source}`
   );
+
+  return {
+    async stop() {
+      client.destroy();
+      console.log(`[discord] stopped name=${config.name}`);
+    }
+  };
 }

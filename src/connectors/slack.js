@@ -359,4 +359,11 @@ export async function startSlackBot(config, options) {
   console.log(
     `[slack] started name=${config.name} bot_user=${botUserId} model=${config.model || "default"} web_search=${config.webSearch} system_prompt_source=${systemPromptInfo.source}`
   );
+
+  return {
+    async stop() {
+      await app.stop();
+      console.log(`[slack] stopped name=${config.name}`);
+    }
+  };
 }
