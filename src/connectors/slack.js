@@ -182,7 +182,8 @@ export async function startSlackBot(config, options) {
           channel: event.channel,
           ts: replyTs,
           text: toSlackText(text),
-          parse: "none"
+          parse: "none",
+          mrkdwn: true
         });
         lastUpdateAt = now;
       };
@@ -255,7 +256,8 @@ export async function startSlackBot(config, options) {
           channel: event.channel,
           ts: replyTs,
           text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
-          parse: "none"
+          parse: "none",
+          mrkdwn: true
         });
         return;
       }
