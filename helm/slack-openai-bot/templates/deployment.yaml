@@ -39,11 +39,24 @@ spec:
                 secretKeyRef:
                   name: {{ include "slack-openai-bot.authSecretName" . }}
                   key: CODEX_ACCESS_TOKEN
+                  optional: true
+            - name: CODEX_REFRESH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "slack-openai-bot.authSecretName" . }}
+                  key: CODEX_REFRESH_TOKEN
+                  optional: true
             - name: CODEX_ACCOUNT_ID
               valueFrom:
                 secretKeyRef:
                   name: {{ include "slack-openai-bot.authSecretName" . }}
                   key: CODEX_ACCOUNT_ID
+                  optional: true
+            - name: CODEX_REFRESH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "slack-openai-bot.authSecretName" . }}
+                  key: CODEX_REFRESH_CLIENT_ID
                   optional: true
             - name: MAX_THREAD_HISTORY
               value: {{ .Values.env.maxThreadHistory | quote }}

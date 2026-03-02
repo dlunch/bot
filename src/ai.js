@@ -1,24 +1,163 @@
 const codexEndpoint = "https://chatgpt.com/backend-api/codex/responses";
+const refreshEndpoint = "https://auth.openai.com/oauth/token";
+const refreshExpirySkewMs = 30_000;
 
-function normalizeModelName(name) {
-  if (name === "5.3-codex") {
-    return "gpt-5.3-codex";
-  }
-
-  return name;
-}
 const defaultSystemPrompt =
   "You are a concise and helpful assistant. Continue the conversation naturally using the context.";
 
-function readCodexAuthFromEnv() {
-  const accessToken = process.env.CODEX_ACCESS_TOKEN?.trim();
-  const accountId = process.env.CODEX_ACCOUNT_ID?.trim() || undefined;
+let codexAuthState;
+let refreshInFlight;
 
-  if (!accessToken) {
+function readOptionalEnv(name) {
+  if (typeof process.env[name] !== "string") {
+    return undefined;
+  }
+
+  const trimmed = process.env[name].trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function parseJson(raw) {
+  if (!raw) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+function extractErrorDetail(raw, payload) {
+  return (
+    payload?.detail?.message ||
+    payload?.detail?.code ||
+    payload?.error_description ||
+    payload?.error?.message ||
+    payload?.error ||
+    raw ||
+    "unknown_error"
+  );
+}
+
+function getCodexAuthState() {
+  if (codexAuthState) {
+    return codexAuthState;
+  }
+
+  const accessToken = readOptionalEnv("CODEX_ACCESS_TOKEN");
+  const refreshToken = readOptionalEnv("CODEX_REFRESH_TOKEN");
+  const accountId = readOptionalEnv("CODEX_ACCOUNT_ID");
+  const refreshClientId = readOptionalEnv("CODEX_REFRESH_CLIENT_ID");
+
+  if (!accessToken && !refreshToken) {
+    throw new Error("CODEX_ACCESS_TOKEN or CODEX_REFRESH_TOKEN is required");
+  }
+
+  codexAuthState = {
+    accessToken,
+    refreshToken,
+    accountId,
+    refreshClientId,
+    accessTokenExpiresAt: undefined
+  };
+
+  return codexAuthState;
+}
+
+function shouldRefreshAccessToken(auth) {
+  return Boolean(
+    auth.refreshToken &&
+      (!auth.accessToken ||
+        (typeof auth.accessTokenExpiresAt === "number" && Date.now() >= auth.accessTokenExpiresAt))
+  );
+}
+
+async function refreshCodexAccessToken() {
+  const auth = getCodexAuthState();
+  if (!auth.refreshToken) {
+    throw new Error("CODEX_REFRESH_TOKEN is required to refresh access token");
+  }
+
+  if (refreshInFlight) {
+    return refreshInFlight;
+  }
+
+  refreshInFlight = (async () => {
+    const form = new URLSearchParams();
+    form.set("grant_type", "refresh_token");
+    form.set("refresh_token", auth.refreshToken);
+    if (auth.refreshClientId) {
+      form.set("client_id", auth.refreshClientId);
+    }
+
+    const refreshRes = await fetch(refreshEndpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: form.toString()
+    });
+
+    const refreshRaw = await refreshRes.text();
+    const refreshPayload = parseJson(refreshRaw);
+    if (!refreshRes.ok) {
+      throw new Error(`Codex token refresh failed: ${extractErrorDetail(refreshRaw, refreshPayload)}`);
+    }
+
+    const nextAccessToken =
+      typeof refreshPayload?.access_token === "string" ? refreshPayload.access_token.trim() : "";
+    if (!nextAccessToken) {
+      throw new Error("Codex token refresh failed: access_token missing in refresh response");
+    }
+
+    const nextRefreshToken =
+      typeof refreshPayload?.refresh_token === "string" && refreshPayload.refresh_token.trim()
+        ? refreshPayload.refresh_token.trim()
+        : auth.refreshToken;
+    const expiresInSeconds = Number(refreshPayload?.expires_in);
+    const nextAccessTokenExpiresAt =
+      Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
+        ? Date.now() + expiresInSeconds * 1000 - refreshExpirySkewMs
+        : undefined;
+
+    auth.accessToken = nextAccessToken;
+    auth.refreshToken = nextRefreshToken;
+    auth.accessTokenExpiresAt = nextAccessTokenExpiresAt;
+    process.env.CODEX_ACCESS_TOKEN = nextAccessToken;
+    process.env.CODEX_REFRESH_TOKEN = nextRefreshToken;
+
+    return auth;
+  })();
+
+  try {
+    return await refreshInFlight;
+  } finally {
+    refreshInFlight = undefined;
+  }
+}
+
+async function requestCodexResponse(body, auth) {
+  if (!auth.accessToken) {
     throw new Error("CODEX_ACCESS_TOKEN is required");
   }
 
-  return { accessToken, accountId };
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${auth.accessToken}`,
+    Origin: "https://chatgpt.com",
+    Referer: "https://chatgpt.com/"
+  };
+  if (auth.accountId) {
+    headers["ChatGPT-Account-Id"] = auth.accountId;
+  }
+
+  return fetch(codexEndpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body)
+  });
 }
 
 function toResponsesInput(messages) {
@@ -178,14 +317,17 @@ export async function createAiResponse(context, options = {}) {
     throw new Error("model is required for createAiResponse");
   }
 
-  const { accessToken, accountId } = readCodexAuthFromEnv();
+  const auth = getCodexAuthState();
+  if (shouldRefreshAccessToken(auth)) {
+    await refreshCodexAccessToken();
+  }
+
   const systemPrompt =
     typeof options.systemPrompt === "string" && options.systemPrompt.trim()
       ? options.systemPrompt.trim()
       : defaultSystemPrompt;
-  const effectiveModel = normalizeModelName(requestedModel.trim());
   const body = {
-    model: effectiveModel,
+    model: requestedModel.trim(),
     instructions: systemPrompt,
     input: toResponsesInput(context),
     store: false,
@@ -196,34 +338,16 @@ export async function createAiResponse(context, options = {}) {
     body.tools = [{ type: "web_search" }];
   }
 
-  const headers = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${accessToken}`,
-    Origin: "https://chatgpt.com",
-    Referer: "https://chatgpt.com/"
-  };
-  if (accountId) {
-    headers["ChatGPT-Account-Id"] = accountId;
+  let res = await requestCodexResponse(body, auth);
+  if ((res.status === 401 || res.status === 403) && auth.refreshToken) {
+    await refreshCodexAccessToken();
+    res = await requestCodexResponse(body, auth);
   }
-
-  const res = await fetch(codexEndpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body)
-  });
 
   if (!res.ok) {
     const raw = await res.text();
-    const payload = (() => {
-      try {
-        return raw ? JSON.parse(raw) : {};
-      } catch {
-        return {};
-      }
-    })();
-    const detail =
-      payload?.detail?.message || payload?.detail?.code || payload?.error?.message || payload?.error || raw;
-    throw new Error(`Codex request failed: ${detail}`);
+    const payload = parseJson(raw);
+    throw new Error(`Codex request failed: ${extractErrorDetail(raw, payload)}`);
   }
 
   if (res.body) {
@@ -235,13 +359,7 @@ export async function createAiResponse(context, options = {}) {
     return parseSseResponse(raw);
   }
 
-  const payload = (() => {
-    try {
-      return raw ? JSON.parse(raw) : {};
-    } catch {
-      return {};
-    }
-  })();
+  const payload = parseJson(raw);
 
   return extractOutputText(payload);
 }
@@ -250,6 +368,8 @@ export function getAiConfig() {
   return {
     authMode: "codex_env",
     codexAuthSource: "env",
+    hasAccessToken: Boolean(process.env.CODEX_ACCESS_TOKEN?.trim()),
+    hasRefreshToken: Boolean(process.env.CODEX_REFRESH_TOKEN?.trim()),
     hasAccountId: Boolean(process.env.CODEX_ACCOUNT_ID?.trim())
   };
 }

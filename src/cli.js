@@ -63,6 +63,8 @@ console.log("[cli] Codex chat test interface");
 console.log(`[cli] model=${cliConfig.model}`);
 console.log(`[cli] service=${cliConfig.service}:${cliConfig.name}`);
 console.log(`[cli] auth_source=${aiConfig.codexAuthSource}`);
+console.log(`[cli] auth_has_access_token=${aiConfig.hasAccessToken}`);
+console.log(`[cli] auth_has_refresh_token=${aiConfig.hasRefreshToken}`);
 console.log(`[cli] auth_has_account_id=${aiConfig.hasAccountId}`);
 console.log(`[cli] system_prompt=${cliConfig.systemPrompt ? "service" : "default"}`);
 console.log("[cli] /reset to clear context, /exit to quit\n");
