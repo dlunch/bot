@@ -38,15 +38,9 @@ env:
 
 auth:
   # Set this to use a pre-created secret instead of chart-managed one.
-  # The secret keys must include at least one of:
-  # - CODEX_ACCESS_TOKEN
-  # - CODEX_REFRESH_TOKEN
-  # Optional keys: CODEX_ACCOUNT_ID, CODEX_REFRESH_CLIENT_ID.
+  # The secret key CODEX_REFRESH_TOKEN is required.
   existingSecret: ""
-  accessToken: ""
   refreshToken: ""
-  accountId: ""
-  refreshClientId: ""
 
 config:
   # Set this to use a pre-created secret containing services.json.

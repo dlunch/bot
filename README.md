@@ -5,19 +5,13 @@
 - Slack: 멘션/스레드/DM 대응
 - Discord: 멘션/DM 대응
 - IRC: 채널 멘션/DM 대응
-- AI 호출 인증은 환경변수만 사용 (`CODEX_ACCESS_TOKEN` 또는 `CODEX_REFRESH_TOKEN`, 선택: `CODEX_ACCOUNT_ID`)
+- AI 호출 인증은 환경변수만 사용 (`CODEX_REFRESH_TOKEN`)
 
 ## 1) 로컬 CLI로 먼저 테스트
 
 ```bash
 npm install
-export CODEX_ACCESS_TOKEN=your_codex_access_token
-# optional: access token 만료 시 자동 갱신
 export CODEX_REFRESH_TOKEN=your_codex_refresh_token
-# optional: refresh endpoint에서 client_id가 필요한 경우
-# export CODEX_REFRESH_CLIENT_ID=your_client_id
-# optional
-export CODEX_ACCOUNT_ID=your_codex_account_id
 npm run chat
 ```
 
@@ -28,10 +22,8 @@ CLI 명령:
 
 인증 환경변수:
 
-- `CODEX_ACCESS_TOKEN`: Codex 호출용 access token
-- `CODEX_REFRESH_TOKEN` (optional): access token 만료 시 자동 갱신에 사용
-- `CODEX_REFRESH_CLIENT_ID` (optional): refresh endpoint에서 client_id가 필요할 때 사용
-- `CODEX_ACCOUNT_ID` (optional): Codex account id 헤더
+- `CODEX_REFRESH_TOKEN`: access token 자동 갱신에 사용 (required)
+- account id 헤더는 refresh 응답의 토큰 클레임에서 자동 추출
 
 ## 2) 서비스 설정 파일
 
@@ -118,13 +110,7 @@ CLI 명령:
 ## 6) 실행
 
 ```bash
-export CODEX_ACCESS_TOKEN=your_codex_access_token
-# optional: access token 만료 시 자동 갱신
 export CODEX_REFRESH_TOKEN=your_codex_refresh_token
-# optional: refresh endpoint에서 client_id가 필요한 경우
-# export CODEX_REFRESH_CLIENT_ID=your_client_id
-# optional
-export CODEX_ACCOUNT_ID=your_codex_account_id
 npm run start
 ```
 
@@ -133,9 +119,7 @@ npm run start
 ```bash
 docker build -t slack-openai-bot .
 docker run --rm \
-  -e CODEX_ACCESS_TOKEN=your_codex_access_token \
   -e CODEX_REFRESH_TOKEN=your_codex_refresh_token \
-  -e CODEX_ACCOUNT_ID=your_codex_account_id \
   -v "$(pwd)/config/services.json:/app/config/services.json:ro" \
   slack-openai-bot
 ```
@@ -148,7 +132,6 @@ docker run --rm \
 helm upgrade --install bot ./helm/slack-openai-bot \
   --set image.repository=your-repo/slack-openai-bot \
   --set image.tag=latest \
-  --set auth.accessToken=your_codex_access_token \
   --set auth.refreshToken=your_codex_refresh_token
 ```
 

@@ -1,5 +1,6 @@
 const codexEndpoint = "https://chatgpt.com/backend-api/codex/responses";
 const refreshEndpoint = "https://auth.openai.com/oauth/token";
+const refreshClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
 const refreshExpirySkewMs = 30_000;
 
 const defaultSystemPrompt =
@@ -29,6 +30,47 @@ function parseJson(raw) {
   }
 }
 
+function parseJwtClaims(token) {
+  if (typeof token !== "string") {
+    return undefined;
+  }
+
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts[1]) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function extractAccountIdFromClaims(claims) {
+  if (!claims || typeof claims !== "object") {
+    return undefined;
+  }
+
+  const embeddedAuth = claims["https://api.openai.com/auth"];
+  return (
+    claims.chatgpt_account_id ||
+    embeddedAuth?.chatgpt_account_id ||
+    (Array.isArray(claims.organizations) && claims.organizations[0]?.id ? claims.organizations[0].id : undefined)
+  );
+}
+
+function extractAccountIdFromTokens(tokens) {
+  const idTokenClaims = parseJwtClaims(tokens?.id_token);
+  const accountIdFromIdToken = extractAccountIdFromClaims(idTokenClaims);
+  if (accountIdFromIdToken) {
+    return accountIdFromIdToken;
+  }
+
+  const accessTokenClaims = parseJwtClaims(tokens?.access_token);
+  return extractAccountIdFromClaims(accessTokenClaims);
+}
+
 function extractErrorDetail(raw, payload) {
   return (
     payload?.detail?.message ||
@@ -46,20 +88,16 @@ function getCodexAuthState() {
     return codexAuthState;
   }
 
-  const accessToken = readOptionalEnv("CODEX_ACCESS_TOKEN");
   const refreshToken = readOptionalEnv("CODEX_REFRESH_TOKEN");
-  const accountId = readOptionalEnv("CODEX_ACCOUNT_ID");
-  const refreshClientId = readOptionalEnv("CODEX_REFRESH_CLIENT_ID");
 
-  if (!accessToken && !refreshToken) {
-    throw new Error("CODEX_ACCESS_TOKEN or CODEX_REFRESH_TOKEN is required");
+  if (!refreshToken) {
+    throw new Error("CODEX_REFRESH_TOKEN is required");
   }
 
   codexAuthState = {
-    accessToken,
+    accessToken: undefined,
     refreshToken,
-    accountId,
-    refreshClientId,
+    accountId: undefined,
     accessTokenExpiresAt: undefined
   };
 
@@ -88,9 +126,7 @@ async function refreshCodexAccessToken() {
     const form = new URLSearchParams();
     form.set("grant_type", "refresh_token");
     form.set("refresh_token", auth.refreshToken);
-    if (auth.refreshClientId) {
-      form.set("client_id", auth.refreshClientId);
-    }
+    form.set("client_id", refreshClientId);
 
     const refreshRes = await fetch(refreshEndpoint, {
       method: "POST",
@@ -116,6 +152,7 @@ async function refreshCodexAccessToken() {
       typeof refreshPayload?.refresh_token === "string" && refreshPayload.refresh_token.trim()
         ? refreshPayload.refresh_token.trim()
         : auth.refreshToken;
+    const nextAccountId = extractAccountIdFromTokens(refreshPayload) || auth.accountId;
     const expiresInSeconds = Number(refreshPayload?.expires_in);
     const nextAccessTokenExpiresAt =
       Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
@@ -124,8 +161,8 @@ async function refreshCodexAccessToken() {
 
     auth.accessToken = nextAccessToken;
     auth.refreshToken = nextRefreshToken;
+    auth.accountId = nextAccountId;
     auth.accessTokenExpiresAt = nextAccessTokenExpiresAt;
-    process.env.CODEX_ACCESS_TOKEN = nextAccessToken;
     process.env.CODEX_REFRESH_TOKEN = nextRefreshToken;
 
     return auth;
@@ -140,7 +177,7 @@ async function refreshCodexAccessToken() {
 
 async function requestCodexResponse(body, auth) {
   if (!auth.accessToken) {
-    throw new Error("CODEX_ACCESS_TOKEN is required");
+    throw new Error("access token is unavailable; token refresh may have failed");
   }
 
   const headers = {
@@ -368,8 +405,6 @@ export function getAiConfig() {
   return {
     authMode: "codex_env",
     codexAuthSource: "env",
-    hasAccessToken: Boolean(process.env.CODEX_ACCESS_TOKEN?.trim()),
-    hasRefreshToken: Boolean(process.env.CODEX_REFRESH_TOKEN?.trim()),
-    hasAccountId: Boolean(process.env.CODEX_ACCOUNT_ID?.trim())
+    hasRefreshToken: Boolean(process.env.CODEX_REFRESH_TOKEN?.trim())
   };
 }
