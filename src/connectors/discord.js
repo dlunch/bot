@@ -44,31 +44,29 @@ export async function startDiscordBot(config, options) {
   const discordMaxLength = 2000;
 
   function capDiscordText(text = "") {
-    const trimmed = text.trim();
-    if (!trimmed) {
+    if (!text.trim()) {
       return ".";
     }
 
-    if (trimmed.length <= discordMaxLength) {
-      return trimmed;
+    if (text.length <= discordMaxLength) {
+      return text;
     }
 
-    return trimmed.slice(0, discordMaxLength);
+    return text.slice(0, discordMaxLength);
   }
 
   function splitDiscordText(text = "") {
-    const trimmed = text.trim();
-    if (!trimmed) {
+    if (!text.trim()) {
       return ["."];
     }
 
-    if (trimmed.length <= discordMaxLength) {
-      return [trimmed];
+    if (text.length <= discordMaxLength) {
+      return [text];
     }
 
     const chunks = [];
-    for (let i = 0; i < trimmed.length; i += discordMaxLength) {
-      chunks.push(trimmed.slice(i, i + discordMaxLength));
+    for (let i = 0; i < text.length; i += discordMaxLength) {
+      chunks.push(text.slice(i, i + discordMaxLength));
     }
     return chunks;
   }
@@ -117,7 +115,7 @@ export async function startDiscordBot(config, options) {
 
       const updateReply = async (text, force = false) => {
         if (!replyMessage) {
-          return;
+          return 0;
         }
 
         const now = Date.now();
@@ -128,16 +126,69 @@ export async function startDiscordBot(config, options) {
         const content = capDiscordText(text);
         try {
           await replyMessage.edit(content);
+          lastUpdateAt = now;
+          return content === "." ? 0 : content.length;
         } catch (error) {
           if (!isDiscordTooLong(error)) {
             throw error;
           }
-          const mid = Math.floor(content.length / 2);
-          await replyMessage.edit(content.slice(0, mid) || ".");
-          currentMsgOffset += mid;
-          replyMessage = await message.channel.send(capDiscordText(content.slice(mid)));
+
+          if (content.length <= 1) {
+            throw error;
+          }
+
+          const consumedLength = Math.floor(content.length / 2);
+          await replyMessage.edit(content.slice(0, consumedLength) || ".");
+          lastUpdateAt = now;
+          return consumedLength;
         }
-        lastUpdateAt = now;
+      };
+
+      const postMessage = async (text) => {
+        const content = capDiscordText(text);
+        const send = currentMsgOffset === 0 ? () => message.reply(content) : () => message.channel.send(content);
+        try {
+          const reply = await send();
+          return { reply, consumedLength: content === "." ? 0 : content.length };
+        } catch (error) {
+          if (!isDiscordTooLong(error) || content.length <= 1) {
+            throw error;
+          }
+
+          const consumedLength = Math.floor(content.length / 2);
+          const fallbackContent = content.slice(0, consumedLength) || ".";
+          const reply = currentMsgOffset === 0
+            ? await message.reply(fallbackContent)
+            : await message.channel.send(fallbackContent);
+          return { reply, consumedLength };
+        }
+      };
+
+      const syncReply = async (force = false) => {
+        while (true) {
+          const currentText = streamedText.slice(currentMsgOffset);
+          if (!currentText.trim()) {
+            return;
+          }
+
+          let consumedLength = 0;
+          if (replyMessage) {
+            consumedLength = await updateReply(currentText, force);
+          } else {
+            const result = await postMessage(currentText);
+            replyMessage = result.reply;
+            lastUpdateAt = Date.now();
+            consumedLength = result.consumedLength;
+          }
+
+          if (consumedLength >= currentText.length) {
+            return;
+          }
+
+          currentMsgOffset += consumedLength;
+          replyMessage = null;
+          lastUpdateAt = 0;
+        }
       };
 
       const scheduleUpdate = () => {
@@ -148,7 +199,7 @@ export async function startDiscordBot(config, options) {
         pendingUpdate = setTimeout(async () => {
           pendingUpdate = null;
           try {
-            await updateReply(streamedText.slice(currentMsgOffset), true);
+            await syncReply(true);
           } catch (error) {
             console.error("[discord][message_update] error", error);
           }
@@ -164,25 +215,13 @@ export async function startDiscordBot(config, options) {
             streamedText = fullText;
             const currentText = streamedText.slice(currentMsgOffset);
 
-            if (!replyMessage && currentText.trim()) {
-              replyMessage = await message.reply(capDiscordText(currentText));
-              lastUpdateAt = Date.now();
-              return;
-            }
-
-            if (currentText.length > discordMaxLength && replyMessage) {
-              await updateReply(currentText, true);
-              currentMsgOffset += discordMaxLength;
-              const overflowText = streamedText.slice(currentMsgOffset);
-              if (overflowText.trim()) {
-                replyMessage = await message.channel.send(capDiscordText(overflowText));
-                lastUpdateAt = Date.now();
-              }
+            if (!replyMessage || currentText.length > discordMaxLength) {
+              await syncReply(true);
               return;
             }
 
             if (Date.now() - lastUpdateAt >= discordStreamUpdateMs) {
-              await updateReply(currentText, true);
+              await syncReply(true);
             } else {
               scheduleUpdate();
             }
@@ -194,32 +233,8 @@ export async function startDiscordBot(config, options) {
         pendingUpdate = null;
       }
 
-      const finalText = answer || streamedText || "응답을 생성하지 못했어요.";
-      const remainingText = currentMsgOffset > 0
-        ? streamedText.slice(currentMsgOffset)
-        : finalText;
-      const finalChunks = splitDiscordText(remainingText);
-
-      if (replyMessage) {
-        await updateReply(finalChunks[0], true);
-      } else {
-        replyMessage = await message.reply(capDiscordText(finalChunks[0]));
-      }
-
-      for (let i = 1; i < finalChunks.length; i++) {
-        try {
-          await message.channel.send(finalChunks[i]);
-        } catch (sendError) {
-          if (!isDiscordTooLong(sendError) || finalChunks[i].length <= 500) {
-            throw sendError;
-          }
-          const mid = Math.floor(finalChunks[i].length / 2);
-          await message.channel.send(finalChunks[i].slice(0, mid) || ".");
-          if (mid < finalChunks[i].length) {
-            finalChunks.splice(i + 1, 0, finalChunks[i].slice(mid));
-          }
-        }
-      }
+      streamedText = answer || streamedText || "응답을 생성하지 못했어요.";
+      await syncReply(true);
     } catch (error) {
       console.error("[discord][message] error", error);
       try {
