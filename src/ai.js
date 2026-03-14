@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+
 const codexEndpoint = "https://chatgpt.com/backend-api/codex/responses";
 const refreshEndpoint = "https://auth.openai.com/oauth/token";
 const refreshClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -8,6 +11,33 @@ const defaultSystemPrompt =
 
 let codexAuthState;
 let refreshInFlight;
+
+async function readOptionalFile(filePath) {
+  if (typeof filePath !== "string" || !filePath.trim()) {
+    return undefined;
+  }
+
+  try {
+    const raw = await fs.readFile(filePath.trim(), "utf8");
+    const trimmed = raw.trim();
+    return trimmed ? trimmed : undefined;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function writeRefreshTokenFile(filePath, refreshToken) {
+  if (typeof filePath !== "string" || !filePath.trim()) {
+    return;
+  }
+
+  const targetPath = filePath.trim();
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  await fs.writeFile(targetPath, `${refreshToken}\n`, { mode: 0o600 });
+}
 
 function readOptionalEnv(name) {
   if (typeof process.env[name] !== "string") {
@@ -83,12 +113,25 @@ function extractErrorDetail(raw, payload) {
   );
 }
 
-function getCodexAuthState() {
+function formatRefreshFailure(detail, auth) {
+  if (!detail.includes("refresh token has already been used")) {
+    return detail;
+  }
+
+  if (auth?.refreshTokenFile) {
+    return `${detail} (check that ${auth.refreshTokenFile} is writable and survives pod restarts)`;
+  }
+
+  return `${detail} (the refresh token is rotated on use; persist the latest token via CODEX_REFRESH_TOKEN_FILE or update the secret/env after rotation)`;
+}
+
+async function getCodexAuthState() {
   if (codexAuthState) {
     return codexAuthState;
   }
 
-  const refreshToken = readOptionalEnv("CODEX_REFRESH_TOKEN");
+  const refreshTokenFile = readOptionalEnv("CODEX_REFRESH_TOKEN_FILE") || path.join(process.cwd(), "data", "codex-refresh-token");
+  const refreshToken = (await readOptionalFile(refreshTokenFile)) || readOptionalEnv("CODEX_REFRESH_TOKEN");
 
   if (!refreshToken) {
     throw new Error("CODEX_REFRESH_TOKEN is required");
@@ -97,6 +140,7 @@ function getCodexAuthState() {
   codexAuthState = {
     accessToken: undefined,
     refreshToken,
+    refreshTokenFile,
     accountId: undefined,
     accessTokenExpiresAt: undefined
   };
@@ -113,7 +157,7 @@ function shouldRefreshAccessToken(auth) {
 }
 
 async function refreshCodexAccessToken() {
-  const auth = getCodexAuthState();
+  const auth = await getCodexAuthState();
   if (!auth.refreshToken) {
     throw new Error("CODEX_REFRESH_TOKEN is required to refresh access token");
   }
@@ -139,7 +183,8 @@ async function refreshCodexAccessToken() {
     const refreshRaw = await refreshRes.text();
     const refreshPayload = parseJson(refreshRaw);
     if (!refreshRes.ok) {
-      throw new Error(`Codex token refresh failed: ${extractErrorDetail(refreshRaw, refreshPayload)}`);
+      const detail = extractErrorDetail(refreshRaw, refreshPayload);
+      throw new Error(`Codex token refresh failed: ${formatRefreshFailure(detail, auth)}`);
     }
 
     const nextAccessToken =
@@ -164,6 +209,7 @@ async function refreshCodexAccessToken() {
     auth.accountId = nextAccountId;
     auth.accessTokenExpiresAt = nextAccessTokenExpiresAt;
     process.env.CODEX_REFRESH_TOKEN = nextRefreshToken;
+    await writeRefreshTokenFile(auth.refreshTokenFile, nextRefreshToken);
 
     return auth;
   })();
@@ -354,7 +400,7 @@ export async function createAiResponse(context, options = {}) {
     throw new Error("model is required for createAiResponse");
   }
 
-  const auth = getCodexAuthState();
+  const auth = await getCodexAuthState();
   if (shouldRefreshAccessToken(auth)) {
     await refreshCodexAccessToken();
   }
@@ -402,9 +448,11 @@ export async function createAiResponse(context, options = {}) {
 }
 
 export function getAiConfig() {
+  const refreshTokenFile = readOptionalEnv("CODEX_REFRESH_TOKEN_FILE") || path.join(process.cwd(), "data", "codex-refresh-token");
   return {
     authMode: "codex_env",
-    codexAuthSource: "env",
+    codexAuthSource: "env+file",
+    refreshTokenFile,
     hasRefreshToken: Boolean(process.env.CODEX_REFRESH_TOKEN?.trim())
   };
 }
