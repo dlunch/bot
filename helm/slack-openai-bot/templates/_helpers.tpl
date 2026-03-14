@@ -47,3 +47,11 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-services" (include "slack-openai-bot.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "slack-openai-bot.authPersistenceClaimName" -}}
+{{- if .Values.auth.persistence.existingClaim -}}
+{{- .Values.auth.persistence.existingClaim -}}
+{{- else -}}
+{{- printf "%s-auth" (include "slack-openai-bot.fullname" .) -}}
+{{- end -}}
+{{- end -}}

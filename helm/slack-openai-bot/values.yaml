@@ -37,10 +37,14 @@ env:
   discordStreamUpdateMs: 800
 
 auth:
-  # Set this to use a pre-created secret instead of chart-managed one.
-  # The secret key CODEX_REFRESH_TOKEN is required.
   existingSecret: ""
   refreshToken: ""
+  refreshTokenFile: /app/data/codex-refresh-token
+  persistence:
+    existingClaim: ""
+    accessMode: ReadWriteOnce
+    size: 1Gi
+    mountPath: /app/data
 
 config:
   # Set this to use a pre-created secret containing services.json.
