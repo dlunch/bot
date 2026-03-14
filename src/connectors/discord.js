@@ -97,6 +97,7 @@ export async function startDiscordBot(config, options) {
     let addedReaction = false;
     let streamedText = "";
     let currentMsgOffset = 0;
+    let syncInFlight = Promise.resolve();
 
     try {
       try {
@@ -191,6 +192,12 @@ export async function startDiscordBot(config, options) {
         }
       };
 
+      const runSyncReply = async (force = false) => {
+        const nextSync = syncInFlight.then(() => syncReply(force));
+        syncInFlight = nextSync.catch(() => undefined);
+        return nextSync;
+      };
+
       const scheduleUpdate = () => {
         if (pendingUpdate) {
           return;
@@ -199,7 +206,7 @@ export async function startDiscordBot(config, options) {
         pendingUpdate = setTimeout(async () => {
           pendingUpdate = null;
           try {
-            await syncReply(true);
+            await runSyncReply(true);
           } catch (error) {
             console.error("[discord][message_update] error", error);
           }
@@ -216,12 +223,20 @@ export async function startDiscordBot(config, options) {
             const currentText = streamedText.slice(currentMsgOffset);
 
             if (!replyMessage || currentText.length > discordMaxLength) {
-              await syncReply(true);
+              if (pendingUpdate) {
+                clearTimeout(pendingUpdate);
+                pendingUpdate = null;
+              }
+              await runSyncReply(true);
               return;
             }
 
             if (Date.now() - lastUpdateAt >= discordStreamUpdateMs) {
-              await syncReply(true);
+              if (pendingUpdate) {
+                clearTimeout(pendingUpdate);
+                pendingUpdate = null;
+              }
+              await runSyncReply(true);
             } else {
               scheduleUpdate();
             }
@@ -234,7 +249,7 @@ export async function startDiscordBot(config, options) {
       }
 
       streamedText = answer || streamedText || "응답을 생성하지 못했어요.";
-      await syncReply(true);
+      await runSyncReply(true);
     } catch (error) {
       console.error("[discord][message] error", error);
       try {
