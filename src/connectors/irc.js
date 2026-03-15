@@ -292,7 +292,8 @@ export async function startIrcBot(config, options) {
       try {
         const answer =
           (await createAiResponse(context, {
-            model: config.model,
+            models: config.models,
+            providers: config.providers,
             webSearch: config.webSearch,
             systemPrompt: config.systemPrompt
           })) || "응답을 생성하지 못했어요.";
@@ -498,7 +499,7 @@ export async function startIrcBot(config, options) {
   await readyPromise;
 
   console.log(
-    `[irc] started name=${config.name} server=${host}:${port} ssl=${useTls} sasl=${saslEnabled} nick=${currentNick} channels=${channels.length} model=${config.model || "default"} web_search=${config.webSearch} system_prompt=${config.systemPrompt ? "service" : "default"}`
+    `[irc] started name=${config.name} server=${host}:${port} ssl=${useTls} sasl=${saslEnabled} nick=${currentNick} channels=${channels.length} models=${(config.models || []).join(",")} web_search=${config.webSearch} system_prompt=${config.systemPrompt ? "service" : "default"}`
   );
 
   return {

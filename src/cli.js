@@ -9,61 +9,53 @@ const history = [];
 const servicesFile = path.join(process.cwd(), "config", "services.json");
 const aiConfig = getAiConfig();
 
+function normalizeModels(entry) {
+  if (Array.isArray(entry?.models) && entry.models.length > 0) {
+    return entry.models.map((m) => String(m).trim()).filter(Boolean);
+  }
+  if (typeof entry?.model === "string" && entry.model.trim()) {
+    return [entry.model.trim()];
+  }
+  return [];
+}
+
 async function loadCliConfig() {
   const content = await fs.readFile(servicesFile, "utf8");
   const parsed = JSON.parse(content);
+  const providers = parsed.providers || {};
+
   const findEntry = (entries = []) =>
-    entries.find((entry) => typeof entry?.model === "string" && entry.model.trim());
+    entries.find((entry) => normalizeModels(entry).length > 0);
 
-  const slackEntry = findEntry(parsed?.slack || []);
-  if (slackEntry) {
-    return {
-      model: slackEntry.model.trim(),
-      systemPrompt:
-        typeof slackEntry.systemPrompt === "string" && slackEntry.systemPrompt.trim()
-          ? slackEntry.systemPrompt.trim()
-          : undefined,
-      service: "slack",
-      name: slackEntry.name || "slack"
-    };
+  const allEntries = [
+    ...(parsed.slack || []).map((e) => ({ ...e, service: "slack", name: e.name || "slack" })),
+    ...(parsed.discord || []).map((e) => ({ ...e, service: "discord", name: e.name || "discord" })),
+    ...(parsed.irc || []).map((e) => ({ ...e, service: "irc", name: e.name || "irc" }))
+  ];
+
+  const entry = findEntry(allEntries);
+  if (!entry) {
+    throw new Error("No model found in config/services.json");
   }
 
-  const discordEntry = findEntry(parsed?.discord || []);
-  if (discordEntry) {
-    return {
-      model: discordEntry.model.trim(),
-      systemPrompt:
-        typeof discordEntry.systemPrompt === "string" && discordEntry.systemPrompt.trim()
-          ? discordEntry.systemPrompt.trim()
-          : undefined,
-      service: "discord",
-      name: discordEntry.name || "discord"
-    };
-  }
-
-  const ircEntry = findEntry(parsed?.irc || []);
-  if (ircEntry) {
-    return {
-      model: ircEntry.model.trim(),
-      systemPrompt:
-        typeof ircEntry.systemPrompt === "string" && ircEntry.systemPrompt.trim()
-          ? ircEntry.systemPrompt.trim()
-          : undefined,
-      service: "irc",
-      name: ircEntry.name || "irc"
-    };
-  }
-
-  throw new Error("No model found in config/services.json");
+  return {
+    models: normalizeModels(entry),
+    providers,
+    systemPrompt:
+      typeof entry.systemPrompt === "string" && entry.systemPrompt.trim()
+        ? entry.systemPrompt.trim()
+        : undefined,
+    service: entry.service,
+    name: entry.name
+  };
 }
 
 const cliConfig = await loadCliConfig();
 
-console.log("[cli] Codex chat test interface");
-console.log(`[cli] model=${cliConfig.model}`);
+console.log("[cli] chat test interface");
+console.log(`[cli] models=${cliConfig.models.join(",")}`);
 console.log(`[cli] service=${cliConfig.service}:${cliConfig.name}`);
 console.log(`[cli] auth_source=${aiConfig.codexAuthSource}`);
-console.log(`[cli] auth_has_refresh_token=${aiConfig.hasRefreshToken}`);
 console.log(`[cli] system_prompt=${cliConfig.systemPrompt ? "service" : "default"}`);
 console.log("[cli] /reset to clear context, /exit to quit\n");
 
@@ -90,7 +82,8 @@ while (true) {
     let started = false;
     const answer =
       (await createAiResponse(history, {
-        model: cliConfig.model,
+        models: cliConfig.models,
+        providers: cliConfig.providers,
         systemPrompt: cliConfig.systemPrompt,
         onDelta: (delta) => {
           if (!delta) {

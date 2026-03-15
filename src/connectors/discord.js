@@ -215,7 +215,8 @@ export async function startDiscordBot(config, options) {
 
       const answer =
         (await createAiResponse(context, {
-          model: config.model,
+          models: config.models,
+          providers: config.providers,
           webSearch: config.webSearch,
           systemPrompt: config.systemPrompt,
           onDelta: async (_delta, fullText) => {
@@ -298,7 +299,7 @@ export async function startDiscordBot(config, options) {
 
   await client.login(config.botToken);
   console.log(
-    `[discord] started name=${config.name} bot_user=${client.user?.id} model=${config.model || "default"} web_search=${config.webSearch} system_prompt=${config.systemPrompt ? "service" : "default"}`
+    `[discord] started name=${config.name} bot_user=${client.user?.id} models=${(config.models || []).join(",")} web_search=${config.webSearch} system_prompt=${config.systemPrompt ? "service" : "default"}`
   );
 
   return {

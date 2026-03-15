@@ -23,11 +23,24 @@ async function loadServicesConfig() {
     return trimmed ? trimmed : undefined;
   };
 
+  const providers = parsed.providers || {};
+
+  const normalizeModels = (entry) => {
+    if (Array.isArray(entry.models) && entry.models.length > 0) {
+      return entry.models.map((m) => String(m).trim()).filter(Boolean);
+    }
+    if (typeof entry.model === "string" && entry.model.trim()) {
+      return [entry.model.trim()];
+    }
+    return [];
+  };
+
   const slack = (parsed.slack || []).map((entry) => ({
     name: entry.name || "slack",
     botToken: entry.botToken,
     appToken: entry.appToken,
-    model: entry.model,
+    models: normalizeModels(entry),
+    providers,
     webSearch: Boolean(entry.webSearch),
     systemPrompt: normalizeOptionalString(entry.systemPrompt)
   }));
@@ -35,7 +48,8 @@ async function loadServicesConfig() {
   const discord = (parsed.discord || []).map((entry) => ({
     name: entry.name || "discord",
     botToken: entry.botToken,
-    model: entry.model,
+    models: normalizeModels(entry),
+    providers,
     webSearch: Boolean(entry.webSearch),
     systemPrompt: normalizeOptionalString(entry.systemPrompt)
   }));
@@ -65,7 +79,8 @@ async function loadServicesConfig() {
           password: entry.sasl.password
         }
       : null,
-    model: entry.model,
+    models: normalizeModels(entry),
+    providers,
     webSearch: Boolean(entry.webSearch),
     systemPrompt: normalizeOptionalString(entry.systemPrompt),
     maxMessageLength: entry.maxMessageLength,
@@ -80,8 +95,8 @@ function assertSlackConfig(config) {
     throw new Error(`slack config missing tokens for name=${config.name}`);
   }
 
-  if (typeof config.model !== "string" || !config.model.trim()) {
-    throw new Error(`slack config model is required for name=${config.name}`);
+  if (!config.models?.length) {
+    throw new Error(`slack config model/models is required for name=${config.name}`);
   }
 }
 
@@ -90,8 +105,8 @@ function assertDiscordConfig(config) {
     throw new Error(`discord config missing botToken for name=${config.name}`);
   }
 
-  if (typeof config.model !== "string" || !config.model.trim()) {
-    throw new Error(`discord config model is required for name=${config.name}`);
+  if (!config.models?.length) {
+    throw new Error(`discord config model/models is required for name=${config.name}`);
   }
 }
 
@@ -108,8 +123,8 @@ function assertIrcConfig(config) {
     throw new Error(`irc config channels is required for name=${config.name}`);
   }
 
-  if (typeof config.model !== "string" || !config.model.trim()) {
-    throw new Error(`irc config model is required for name=${config.name}`);
+  if (!config.models?.length) {
+    throw new Error(`irc config model/models is required for name=${config.name}`);
   }
 
   const saslEnabled =

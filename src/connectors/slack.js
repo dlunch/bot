@@ -361,7 +361,8 @@ export async function startSlackBot(config, options) {
 
       const answer =
         (await createAiResponse(context, {
-          model: config.model,
+          models: config.models,
+          providers: config.providers,
           webSearch: config.webSearch,
           systemPrompt: config.systemPrompt,
           onDelta: async (_delta, fullText) => {
@@ -526,7 +527,7 @@ export async function startSlackBot(config, options) {
   botUserId = auth.user_id || null;
   await app.start();
   console.log(
-    `[slack] started name=${config.name} bot_user=${botUserId} model=${config.model || "default"} web_search=${config.webSearch} system_prompt=${config.systemPrompt ? "service" : "default"}`
+    `[slack] started name=${config.name} bot_user=${botUserId} models=${(config.models || []).join(",")} web_search=${config.webSearch} system_prompt=${config.systemPrompt ? "service" : "default"}`
   );
 
   return {
