@@ -1,9 +1,9 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "slack-openai-bot.authPersistenceClaimName" . }}
+  name: {{ include "bot.authPersistenceClaimName" . }}
   labels:
-    {{- include "slack-openai-bot.labels" . | nindent 4 }}
+    {{- include "bot.labels" . | nindent 4 }}
 spec:
   accessModes:
     - {{ .Values.auth.persistence.accessMode }}

@@ -1,18 +1,18 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "slack-openai-bot.fullname" . }}
+  name: {{ include "bot.fullname" . }}
   labels:
-    {{- include "slack-openai-bot.labels" . | nindent 4 }}
+    {{- include "bot.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      {{- include "slack-openai-bot.selectorLabels" . | nindent 6 }}
+      {{- include "bot.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "slack-openai-bot.selectorLabels" . | nindent 8 }}
+        {{- include "bot.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -37,8 +37,14 @@ spec:
             - name: CODEX_REFRESH_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "slack-openai-bot.authSecretName" . }}
+                  name: {{ include "bot.authSecretName" . }}
                   key: CODEX_REFRESH_TOKEN
+                  optional: true
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bot.authSecretName" . }}
+                  key: ANTHROPIC_API_KEY
                   optional: true
             - name: CODEX_REFRESH_TOKEN_FILE
               value: {{ .Values.auth.refreshTokenFile | quote }}
@@ -60,10 +66,10 @@ spec:
       volumes:
         - name: services-config
           secret:
-            secretName: {{ include "slack-openai-bot.servicesSecretName" . }}
+            secretName: {{ include "bot.servicesSecretName" . }}
         - name: auth-state
           persistentVolumeClaim:
-            claimName: {{ include "slack-openai-bot.authPersistenceClaimName" . }}
+            claimName: {{ include "bot.authPersistenceClaimName" . }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

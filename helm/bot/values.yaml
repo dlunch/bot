@@ -39,6 +39,7 @@ env:
 auth:
   existingSecret: ""
   refreshToken: ""
+  anthropicApiKey: ""
   refreshTokenFile: /app/data/codex-refresh-token
   persistence:
     existingClaim: ""
@@ -47,8 +48,13 @@ auth:
     mountPath: /app/data
 
 config:
-  # Set this to use a pre-created secret containing services.json.
   servicesExistingSecret: ""
+
+  providers:
+    codex:
+      models: []
+    anthropic:
+      models: []
 
   services:
     slack: []
