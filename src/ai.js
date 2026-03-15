@@ -6,6 +6,10 @@ const refreshEndpoint = "https://auth.openai.com/oauth/token";
 const refreshClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
 const refreshExpirySkewMs = 30_000;
 
+const anthropicEndpoint = "https://api.anthropic.com/v1/messages";
+const anthropicVersion = "2023-06-01";
+const anthropicDefaultMaxTokens = 16384;
+
 const defaultSystemPrompt =
   "You are a concise and helpful assistant. Continue the conversation naturally using the context.";
 
@@ -134,7 +138,7 @@ async function getCodexAuthState() {
   const refreshToken = (await readOptionalFile(refreshTokenFile)) || readOptionalEnv("CODEX_REFRESH_TOKEN");
 
   if (!refreshToken) {
-    throw new Error("CODEX_REFRESH_TOKEN is required");
+    return undefined;
   }
 
   codexAuthState = {
@@ -158,7 +162,7 @@ function shouldRefreshAccessToken(auth) {
 
 async function refreshCodexAccessToken() {
   const auth = await getCodexAuthState();
-  if (!auth.refreshToken) {
+  if (!auth?.refreshToken) {
     throw new Error("CODEX_REFRESH_TOKEN is required to refresh access token");
   }
 
@@ -319,7 +323,7 @@ function parseSseResponse(raw) {
   return deltaText.trim() || fallbackText.trim();
 }
 
-async function parseSseStream(stream, onDelta) {
+async function parseCodexSseStream(stream, onDelta) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -394,23 +398,116 @@ async function parseSseStream(stream, onDelta) {
   return deltaText.trim() || fallbackText.trim();
 }
 
-export async function createAiResponse(context, options = {}) {
-  const { onDelta, model: requestedModel, webSearch } = options;
-  if (typeof requestedModel !== "string" || !requestedModel.trim()) {
-    throw new Error("model is required for createAiResponse");
+async function parseAnthropicSseStream(stream, onDelta) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let deltaText = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    while (true) {
+      const splitIndex = buffer.indexOf("\n\n");
+      if (splitIndex === -1) {
+        break;
+      }
+
+      const block = buffer.slice(0, splitIndex);
+      buffer = buffer.slice(splitIndex + 2);
+
+      let data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("data:")) {
+          data = line.slice(5).trim();
+        }
+      }
+
+      if (!data) {
+        continue;
+      }
+
+      let event;
+      try {
+        event = JSON.parse(data);
+      } catch {
+        continue;
+      }
+
+      if (
+        event?.type === "content_block_delta" &&
+        event?.delta?.type === "text_delta" &&
+        typeof event.delta.text === "string"
+      ) {
+        deltaText += event.delta.text;
+        if (onDelta) {
+          await onDelta(event.delta.text, deltaText);
+        }
+      }
+    }
   }
 
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    for (const line of buffer.split("\n")) {
+      if (!line.startsWith("data:")) {
+        continue;
+      }
+      try {
+        const event = JSON.parse(line.slice(5).trim());
+        if (event?.delta?.type === "text_delta" && typeof event.delta.text === "string") {
+          deltaText += event.delta.text;
+          if (onDelta) {
+            await onDelta(event.delta.text, deltaText);
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return deltaText.trim();
+}
+
+class RateLimitError extends Error {
+  constructor(provider, model, detail) {
+    super(`[${provider}] rate limited on model=${model}: ${detail}`);
+    this.provider = provider;
+    this.model = model;
+  }
+}
+
+function resolveProvider(model, providers) {
+  if (!providers || typeof providers !== "object") {
+    return "codex";
+  }
+
+  for (const [name, config] of Object.entries(providers)) {
+    if (Array.isArray(config?.models) && config.models.includes(model)) {
+      return name;
+    }
+  }
+
+  return "codex";
+}
+
+async function callCodex(model, context, systemPrompt, webSearch, onDelta) {
   const auth = await getCodexAuthState();
+  if (!auth) {
+    throw new Error("Codex provider is not configured (CODEX_REFRESH_TOKEN missing)");
+  }
+
   if (shouldRefreshAccessToken(auth)) {
     await refreshCodexAccessToken();
   }
 
-  const systemPrompt =
-    typeof options.systemPrompt === "string" && options.systemPrompt.trim()
-      ? options.systemPrompt.trim()
-      : defaultSystemPrompt;
   const body = {
-    model: requestedModel.trim(),
+    model,
     instructions: systemPrompt,
     input: toResponsesInput(context),
     store: false,
@@ -427,14 +524,18 @@ export async function createAiResponse(context, options = {}) {
     res = await requestCodexResponse(body, auth);
   }
 
+  if (res.status === 429) {
+    const raw = await res.text();
+    throw new RateLimitError("codex", model, extractErrorDetail(raw, parseJson(raw)));
+  }
+
   if (!res.ok) {
     const raw = await res.text();
-    const payload = parseJson(raw);
-    throw new Error(`Codex request failed: ${extractErrorDetail(raw, payload)}`);
+    throw new Error(`Codex request failed (model=${model}): ${extractErrorDetail(raw, parseJson(raw))}`);
   }
 
   if (res.body) {
-    return parseSseStream(res.body, onDelta);
+    return parseCodexSseStream(res.body, onDelta);
   }
 
   const raw = await res.text();
@@ -442,17 +543,121 @@ export async function createAiResponse(context, options = {}) {
     return parseSseResponse(raw);
   }
 
-  const payload = parseJson(raw);
+  return extractOutputText(parseJson(raw));
+}
 
-  return extractOutputText(payload);
+function getAnthropicApiKey() {
+  return readOptionalEnv("ANTHROPIC_API_KEY");
+}
+
+async function callAnthropic(model, context, systemPrompt, onDelta) {
+  const apiKey = getAnthropicApiKey();
+    if (!apiKey) {
+    throw new Error("Anthropic provider is not configured (ANTHROPIC_API_KEY env missing)");
+  }
+
+  const messages = context.map((msg) => ({
+    role: msg.role === "assistant" ? "assistant" : "user",
+    content: msg.content
+  }));
+
+  const res = await fetch(anthropicEndpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": anthropicVersion
+    },
+    body: JSON.stringify({
+      model,
+      system: systemPrompt,
+      messages,
+      max_tokens: anthropicDefaultMaxTokens,
+      stream: true
+    })
+  });
+
+  if (res.status === 429) {
+    const raw = await res.text();
+    throw new RateLimitError("anthropic", model, extractErrorDetail(raw, parseJson(raw)));
+  }
+
+  if (!res.ok) {
+    const raw = await res.text();
+    const payload = parseJson(raw);
+    if (payload?.error?.type === "rate_limit_error") {
+      throw new RateLimitError("anthropic", model, extractErrorDetail(raw, payload));
+    }
+    throw new Error(`Anthropic request failed (model=${model}): ${extractErrorDetail(raw, payload)}`);
+  }
+
+  if (res.body) {
+    return parseAnthropicSseStream(res.body, onDelta);
+  }
+
+  const raw = await res.text();
+  const payload = parseJson(raw);
+  return (payload?.content || [])
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("")
+    .trim();
+}
+
+export async function createAiResponse(context, options = {}) {
+  const { onDelta, webSearch, providers } = options;
+
+  const models =
+    Array.isArray(options.models) && options.models.length > 0
+      ? options.models
+      : typeof options.model === "string" && options.model.trim()
+        ? [options.model.trim()]
+        : [];
+
+  if (!models.length) {
+    throw new Error("at least one model is required for createAiResponse");
+  }
+
+  const systemPrompt =
+    typeof options.systemPrompt === "string" && options.systemPrompt.trim()
+      ? options.systemPrompt.trim()
+      : defaultSystemPrompt;
+
+  let lastError;
+  for (const model of models) {
+    const provider = resolveProvider(model, providers);
+
+    try {
+      const result = provider === "anthropic"
+        ? await callAnthropic(model, context, systemPrompt, onDelta)
+        : await callCodex(model, context, systemPrompt, webSearch, onDelta);
+
+      if (result) {
+        return result;
+      }
+    } catch (error) {
+      lastError = error;
+      if (error instanceof RateLimitError && models.indexOf(model) < models.length - 1) {
+        console.warn(`[ai] ${error.message}, falling back to next model`);
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+
+  return "";
 }
 
 export function getAiConfig() {
   const refreshTokenFile = readOptionalEnv("CODEX_REFRESH_TOKEN_FILE") || path.join(process.cwd(), "data", "codex-refresh-token");
   return {
-    authMode: "codex_env",
     codexAuthSource: "env+file",
     refreshTokenFile,
-    hasRefreshToken: Boolean(process.env.CODEX_REFRESH_TOKEN?.trim())
+    hasRefreshToken: Boolean(process.env.CODEX_REFRESH_TOKEN?.trim()),
+    hasAnthropicKey: Boolean(readOptionalEnv("ANTHROPIC_API_KEY"))
   };
 }
