@@ -38,15 +38,41 @@ env:
 
 auth:
   existingSecret: ""
-  refreshToken: ""
-  anthropicApiKey: ""
-  refreshTokenFile: /app/data/codex-refresh-token
+
+  codex:
+    refreshToken: ""
+    refreshTokenFile: /app/data/codex-refresh-token
+
+  anthropic:
+    apiKey: ""
+
   persistence:
     existingClaim: ""
     accessMode: ReadWriteOnce
     size: 1Gi
     mountPath: /app/data
 
+# providers: model-to-provider 매핑. rate limit 시 models 순서대로 fallback.
+# services: 각 서비스 설정. models 배열의 순서가 fallback 우선순위.
+#
+# config:
+#   providers:
+#     codex:
+#       models: ["gpt-5.3-codex"]
+#     anthropic:
+#       models: ["claude-sonnet-4-20250514"]
+#   services:
+#     slack:
+#       - name: main
+#         botToken: xoxb-...
+#         appToken: xapp-...
+#         models: ["gpt-5.3-codex", "claude-sonnet-4-20250514"]
+#         webSearch: true
+#     discord:
+#       - name: main
+#         botToken: "..."
+#         models: ["claude-sonnet-4-20250514"]
+#     irc: []
 config:
   servicesExistingSecret: ""
 

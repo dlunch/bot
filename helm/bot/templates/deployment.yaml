@@ -47,7 +47,7 @@ spec:
                   key: ANTHROPIC_API_KEY
                   optional: true
             - name: CODEX_REFRESH_TOKEN_FILE
-              value: {{ .Values.auth.refreshTokenFile | quote }}
+              value: {{ .Values.auth.codex.refreshTokenFile | quote }}
             - name: MAX_THREAD_HISTORY
               value: {{ .Values.env.maxThreadHistory | quote }}
             - name: SLACK_STREAM_UPDATE_MS
