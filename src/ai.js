@@ -10,8 +10,7 @@ const anthropicEndpoint = "https://api.anthropic.com/v1/messages";
 const anthropicVersion = "2023-06-01";
 const anthropicDefaultMaxTokens = 16384;
 
-const defaultSystemPrompt =
-  "You are a concise and helpful assistant. Continue the conversation naturally using the context.";
+const defaultSystemPrompt = "You are a concise and helpful assistant. Continue the conversation naturally using the context.";
 
 let codexAuthState;
 let refreshInFlight;
