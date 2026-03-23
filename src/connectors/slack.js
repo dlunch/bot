@@ -7,7 +7,9 @@ export async function startSlackBot(config, options) {
   const { maxThreadHistory, slackStreamUpdateMs } = options;
   const receiver = new SocketModeReceiver({
     appToken: config.appToken,
-    pingPongLoggingEnabled: false
+    pingPongLoggingEnabled: false,
+    clientPingTimeoutMS: 30_000,
+    serverPingTimeoutMS: 30_000
   });
 
   const app = new App({
