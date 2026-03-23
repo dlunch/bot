@@ -232,6 +232,6 @@ function assertIrcConfig(config) {
   }
 
   console.log(
-    `[server] services started slack=${slackBots.length} discord=${discordBots.length} irc=${ircBots.length} auth=${ai.authMode}`
+    `[server] services started slack=${slackBots.length} discord=${discordBots.length} irc=${ircBots.length} codex=${ai.hasRefreshToken} anthropic=${ai.hasAnthropicKey}`
   );
 })();

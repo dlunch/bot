@@ -6,7 +6,8 @@ const { App, SocketModeReceiver } = SlackBolt;
 export async function startSlackBot(config, options) {
   const { maxThreadHistory, slackStreamUpdateMs } = options;
   const receiver = new SocketModeReceiver({
-    appToken: config.appToken
+    appToken: config.appToken,
+    pingPongLoggingEnabled: false
   });
 
   const app = new App({
