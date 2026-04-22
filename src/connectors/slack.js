@@ -245,6 +245,86 @@ export async function startSlackBot(config, options) {
     }
   }
 
+  const maxImagesInContext = 3;
+  const maxImageBytes = 5 * 1024 * 1024;
+
+  async function fetchSlackImageAsDataUrl(file) {
+    const url = file?.url_private_download || file?.url_private;
+    if (!url || typeof file?.mimetype !== "string" || !file.mimetype.startsWith("image/")) {
+      return null;
+    }
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${config.botToken}` }
+      });
+      if (!res.ok) {
+        console.warn(`[slack][image_fetch] http ${res.status} file=${file.id}`);
+        return null;
+      }
+      const ab = await res.arrayBuffer();
+      if (ab.byteLength > maxImageBytes) {
+        console.warn(`[slack][image_fetch] skipping large file id=${file.id} bytes=${ab.byteLength}`);
+        return null;
+      }
+      const base64 = Buffer.from(ab).toString("base64");
+      return `data:${file.mimetype};base64,${base64}`;
+    } catch (err) {
+      console.warn(`[slack][image_fetch] failed id=${file?.id}`, err);
+      return null;
+    }
+  }
+
+  async function enrichContextWithImages(context, messages) {
+    // Collect the most-recent N images from thread history and attach them ALL
+    // to the last user turn (which is the current request). This lets the model
+    // "see" the bot's prior generations for edit follow-ups ("make it orange")
+    // without needing input_image on assistant-role messages, which the API
+    // does not accept. Oldest-to-newest preserves conversation reference order.
+    const collected = [];
+    let budget = maxImagesInContext;
+    for (let i = messages.length - 1; i >= 0 && budget > 0; i--) {
+      const files = messages[i]?.files;
+      if (!Array.isArray(files) || !files.length) {
+        continue;
+      }
+      for (const file of files) {
+        if (budget <= 0) {
+          break;
+        }
+        const dataUrl = await fetchSlackImageAsDataUrl(file);
+        if (dataUrl) {
+          collected.unshift(dataUrl);
+          budget--;
+        }
+      }
+    }
+
+    if (collected.length === 0) {
+      return context;
+    }
+
+    let lastUserIdx = -1;
+    for (let i = context.length - 1; i >= 0; i--) {
+      if (context[i].role === "user") {
+        lastUserIdx = i;
+        break;
+      }
+    }
+    if (lastUserIdx === -1) {
+      return context;
+    }
+
+    const enriched = [...context];
+    enriched[lastUserIdx] = {
+      role: "user",
+      content: [
+        { type: "input_text", text: context[lastUserIdx].content },
+        ...collected.map((url) => ({ type: "input_image", image_url: url }))
+      ]
+    };
+    return enriched;
+  }
+
   async function buildThreadContext(client, event) {
     if (isDirectMessage(event) && !event.thread_ts) {
       try {
@@ -254,6 +334,7 @@ export async function startSlackBot(config, options) {
         }), "conversations_history");
 
         const messages = [...(history.messages || [])].reverse();
+        const keptMessages = [];
         const context = [];
 
         for (const message of messages) {
@@ -269,13 +350,14 @@ export async function startSlackBot(config, options) {
           const isAssistant =
             (botUserId && message.user === botUserId) || Boolean(message.bot_id);
 
+          keptMessages.push(message);
           context.push({
             role: isAssistant ? "assistant" : "user",
             content: text
           });
         }
 
-        return context;
+        return await enrichContextWithImages(context, keptMessages);
       } catch (error) {
         console.error("[slack][dm_context] history load failed, fallback to current message", error);
         const fallbackText = cleanSlackText(event.text || "");
@@ -291,6 +373,7 @@ export async function startSlackBot(config, options) {
     }), "conversations_replies");
 
     const messages = replies.messages || [];
+    const keptMessages = [];
     const context = [];
 
     for (const message of messages) {
@@ -302,13 +385,14 @@ export async function startSlackBot(config, options) {
       const isAssistant =
         (botUserId && message.user === botUserId) || Boolean(message.bot_id);
 
+      keptMessages.push(message);
       context.push({
         role: isAssistant ? "assistant" : "user",
         content: text
       });
     }
 
-    return context;
+    return await enrichContextWithImages(context, keptMessages);
   }
 
   async function hasBotReplyInThread(client, event) {

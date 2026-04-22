@@ -85,9 +85,38 @@ export async function startDiscordBot(config, options) {
     return text.replace(new RegExp(`<@!?${botUserId}>`, "g"), "").replace(/\s+/g, " ").trim();
   }
 
+  const maxImagesInContext = 3;
+  const maxImageBytes = 5 * 1024 * 1024;
+
+  async function fetchDiscordImageAsDataUrl(attachment) {
+    const contentType = attachment?.contentType;
+    const url = attachment?.url;
+    if (!url || typeof contentType !== "string" || !contentType.startsWith("image/")) {
+      return null;
+    }
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        console.warn(`[discord][image_fetch] http ${res.status} id=${attachment.id}`);
+        return null;
+      }
+      const ab = await res.arrayBuffer();
+      if (ab.byteLength > maxImageBytes) {
+        console.warn(`[discord][image_fetch] skipping large attachment id=${attachment.id} bytes=${ab.byteLength}`);
+        return null;
+      }
+      const base64 = Buffer.from(ab).toString("base64");
+      return `data:${contentType};base64,${base64}`;
+    } catch (err) {
+      console.warn(`[discord][image_fetch] failed id=${attachment?.id}`, err);
+      return null;
+    }
+  }
+
   async function buildContext(message, botUserId) {
     const fetched = await message.channel.messages.fetch({ limit: maxThreadHistory });
     const messages = [...fetched.values()].reverse();
+    const keptMessages = [];
     const context = [];
 
     for (const msg of messages) {
@@ -100,13 +129,59 @@ export async function startDiscordBot(config, options) {
         continue;
       }
 
+      keptMessages.push(msg);
       context.push({
         role: msg.author?.id === botUserId ? "assistant" : "user",
         content: text
       });
     }
 
-    return context;
+    // Collect the most-recent N images from thread history and attach them ALL
+    // to the last user turn (which is the current request). See slack.js for
+    // rationale (input_image on assistant role is not accepted).
+    const collected = [];
+    let budget = maxImagesInContext;
+    for (let i = keptMessages.length - 1; i >= 0 && budget > 0; i--) {
+      const attachments = keptMessages[i]?.attachments;
+      if (!attachments || attachments.size === 0) {
+        continue;
+      }
+      for (const attachment of attachments.values()) {
+        if (budget <= 0) {
+          break;
+        }
+        const dataUrl = await fetchDiscordImageAsDataUrl(attachment);
+        if (dataUrl) {
+          collected.unshift(dataUrl);
+          budget--;
+        }
+      }
+    }
+
+    if (collected.length === 0) {
+      return context;
+    }
+
+    let lastUserIdx = -1;
+    for (let i = context.length - 1; i >= 0; i--) {
+      if (context[i].role === "user") {
+        lastUserIdx = i;
+        break;
+      }
+    }
+    if (lastUserIdx === -1) {
+      return context;
+    }
+
+    const enriched = [...context];
+    enriched[lastUserIdx] = {
+      role: "user",
+      content: [
+        { type: "input_text", text: context[lastUserIdx].content },
+        ...collected.map((url) => ({ type: "input_image", image_url: url }))
+      ]
+    };
+    return enriched;
   }
 
   const discordMaxLength = 2000;
