@@ -322,7 +322,7 @@ function parseSseResponse(raw) {
   return deltaText.trim() || fallbackText.trim();
 }
 
-async function parseCodexSseStream(stream, onDelta, onImage) {
+async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -360,6 +360,23 @@ async function parseCodexSseStream(stream, onDelta, onImage) {
       deltaText += event.delta;
       if (onDelta) {
         await onDelta(event.delta, deltaText);
+      }
+      return;
+    }
+
+    // Image generation lifecycle events: in_progress, generating, partial_image,
+    // completed. These do not carry the final base64 (that arrives via
+    // response.output_item.done below) but signal that generation is actively
+    // happening server-side. We surface them via onImageEvent so callers can
+    // show progress and distinguish "empty response" from "image generation
+    // that didn't complete in this attempt".
+    if (typeof event?.type === "string" && event.type.startsWith("response.image_generation_call.")) {
+      if (typeof onImageEvent === "function") {
+        try {
+          await onImageEvent({ type: event.type, itemId: event.item_id });
+        } catch (cbErr) {
+          console.error(`[ai][image] onImageEvent callback threw type=${event.type}`, cbErr);
+        }
       }
       return;
     }
@@ -587,9 +604,11 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
   }
 
   const onImage = typeof options?.onImage === "function" ? options.onImage : undefined;
+  const onImageEvent =
+    typeof options?.onImageEvent === "function" ? options.onImageEvent : undefined;
 
   if (res.body) {
-    return parseCodexSseStream(res.body, onDelta, onImage);
+    return parseCodexSseStream(res.body, onDelta, onImage, onImageEvent);
   }
 
   const raw = await res.text();
@@ -684,12 +703,23 @@ export async function createAiResponse(context, options = {}) {
     : 2;
 
   let imageCount = 0;
+  let imageActivity = false;
   const wrappedOnImage = (buffer, meta) => {
     imageCount++;
     if (userOnImage) {
       return userOnImage(buffer, meta);
     }
     return undefined;
+  };
+  const onImageEvent = (evt) => {
+    // Any lifecycle event (in_progress, generating, partial_image, completed)
+    // means the server is actively generating — log once per attempt so users
+    // know the long wait is real work, and use the flag to differentiate the
+    // retry warning below.
+    if (!imageActivity) {
+      console.log(`[ai] image generation in progress... (${evt?.type})`);
+    }
+    imageActivity = true;
   };
 
   let lastError;
@@ -705,21 +735,29 @@ export async function createAiResponse(context, options = {}) {
 
     for (let attempt = 0; attempt <= emptyRetryCount; attempt++) {
       imageCount = 0;
+      imageActivity = false;
       try {
         const result = provider === "anthropic"
           ? await callAnthropic(model, context, systemPrompt, onDelta)
           : await callCodex(model, context, systemPrompt, webSearch, onDelta, {
               imageGeneration,
-              onImage: wrappedOnImage
+              onImage: wrappedOnImage,
+              onImageEvent
             });
 
         if (result || imageCount > 0) {
           return result || "";
         }
 
-        console.warn(
-          `[ai] empty response from provider=${provider} model=${model} attempt=${attempt + 1}/${emptyRetryCount + 1}`
-        );
+        if (imageActivity) {
+          console.warn(
+            `[ai] image generation did not deliver a completed image from provider=${provider} model=${model} attempt=${attempt + 1}/${emptyRetryCount + 1} (retrying)`
+          );
+        } else {
+          console.warn(
+            `[ai] empty response from provider=${provider} model=${model} attempt=${attempt + 1}/${emptyRetryCount + 1}`
+          );
+        }
       } catch (error) {
         lastError = error;
         if (error instanceof RateLimitError && models.indexOf(model) < models.length - 1) {
