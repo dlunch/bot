@@ -62,6 +62,16 @@ export async function loadServicesConfig(filePath = defaultServicesFile) {
     systemPrompt: normalizeOptionalString(entry.systemPrompt)
   }));
 
+  const cli = parsed.cli
+    ? {
+        models: normalizeModels(parsed.cli),
+        providers,
+        webSearch: Boolean(parsed.cli.webSearch),
+        imageGeneration: parseImageGeneration(parsed.cli),
+        systemPrompt: normalizeOptionalString(parsed.cli.systemPrompt)
+      }
+    : null;
+
   const irc = (parsed.irc || []).map((entry) => ({
     name: entry.name || "irc",
     server: typeof entry.server === "string" ? entry.server.trim() : entry.server,
@@ -99,7 +109,7 @@ export async function loadServicesConfig(filePath = defaultServicesFile) {
     connectTimeoutMs: entry.connectTimeoutMs
   }));
 
-  return { slack, discord, irc };
+  return { slack, discord, irc, cli };
 }
 
 function assertSlackConfig(config) {

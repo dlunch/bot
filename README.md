@@ -11,8 +11,28 @@
 
 ```bash
 npm install
+# 방법 A: Codex CLI를 이미 쓰고 있다면 별도 env 없이 바로 실행
+#         (`~/.codex/auth.json`의 refresh_token을 자동으로 사용하고,
+#          rotation 결과도 같은 파일로 sync-back)
+npm run chat
+
+# 방법 B: auth.json이 없거나 환경변수로 직접 주입하고 싶은 경우
 export CODEX_REFRESH_TOKEN=your_codex_refresh_token
 npm run chat
+```
+
+CLI 설정(`config/services.json`의 `cli` 섹션, required):
+
+```json
+{
+  "cli": {
+    "name": "dev",
+    "model": "gpt-5.3-codex",
+    "systemPrompt": "You are a helpful CLI assistant.",
+    "webSearch": false,
+    "imageGeneration": true
+  }
+}
 ```
 
 CLI 명령:
@@ -20,10 +40,11 @@ CLI 명령:
 - `/reset`: 문맥 초기화
 - `/exit`: 종료
 
-인증 환경변수:
+인증:
 
-- `CODEX_REFRESH_TOKEN`: access token 자동 갱신에 사용 (required)
-- `CODEX_REFRESH_TOKEN_FILE`: refresh token rotation 결과를 저장할 파일 경로 (optional, 재시작 환경 권장)
+- 우선순위: `~/.codex/auth.json` → `CODEX_REFRESH_TOKEN` 환경변수
+- `~/.codex/auth.json`이 존재하면 `tokens.refresh_token`을 사용하고, rotation 시 같은 파일로 자동 back-sync
+- auth.json이 없을 때는 `CODEX_REFRESH_TOKEN` 환경변수 + `CODEX_REFRESH_TOKEN_FILE`(optional) 로 동작
 - account id 헤더는 refresh 응답의 토큰 클레임에서 자동 추출
 
 Kubernetes처럼 재시작이 발생하는 환경에서는 refresh token이 1회 사용 후 회전되므로,

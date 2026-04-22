@@ -1,4 +1,11 @@
 {
+  "cli": {
+    "name": "dev",
+    "model": "gpt-5.3-codex",
+    "systemPrompt": "You are a helpful CLI assistant.",
+    "webSearch": false,
+    "imageGeneration": true
+  },
   "slack": [
     {
       "name": "main",

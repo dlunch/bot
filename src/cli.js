@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import url from "node:url";
@@ -6,6 +7,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { createAiResponse, getAiConfig } from "./ai.js";
 
 const servicesFile = path.join(process.cwd(), "config", "services.json");
+const codexAuthFile = path.join(os.homedir(), ".codex", "auth.json");
 
 function normalizeModels(entry) {
   if (Array.isArray(entry?.models) && entry.models.length > 0) {
@@ -17,51 +19,91 @@ function normalizeModels(entry) {
   return [];
 }
 
+/**
+ * Bootstrap Codex auth from `~/.codex/auth.json` for the CLI.
+ *
+ * Priority: auth.json.tokens.refresh_token → process.env.CODEX_REFRESH_TOKEN.
+ * If auth.json is present, its refresh token takes precedence and we route
+ * rotation I/O into a temp file so nothing gets written under the project's
+ * cwd. Rotated tokens are synced back into auth.json after each turn via
+ * `syncCodexAuth`.
+ *
+ * Returns `null` when auth.json is missing (ai.js falls back to env).
+ */
+export async function loadCodexAuthFromCodexHome() {
+  let content;
+  try {
+    content = await fs.readFile(codexAuthFile, "utf8");
+  } catch (err) {
+    if (err?.code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+
+  const parsed = JSON.parse(content);
+  const refreshToken = parsed?.tokens?.refresh_token;
+  if (typeof refreshToken !== "string" || !refreshToken.trim()) {
+    return null;
+  }
+
+  process.env.CODEX_REFRESH_TOKEN = refreshToken;
+  if (!process.env.CODEX_REFRESH_TOKEN_FILE) {
+    process.env.CODEX_REFRESH_TOKEN_FILE = path.join(
+      os.tmpdir(),
+      `codex-cli-refresh-${process.pid}`
+    );
+  }
+
+  return { parsed, refreshToken };
+}
+
+/**
+ * Write the latest in-memory refresh token back into `~/.codex/auth.json`,
+ * preserving all other fields. No-op when the token hasn't rotated.
+ */
+export async function syncCodexAuth(state) {
+  if (!state) {
+    return;
+  }
+  const current = process.env.CODEX_REFRESH_TOKEN;
+  if (!current || current === state.refreshToken) {
+    return;
+  }
+  const next = {
+    ...state.parsed,
+    tokens: { ...(state.parsed.tokens || {}), refresh_token: current }
+  };
+  await fs.writeFile(codexAuthFile, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+  state.parsed = next;
+  state.refreshToken = current;
+}
+
 export async function loadCliConfig() {
   const content = await fs.readFile(servicesFile, "utf8");
   const parsed = JSON.parse(content);
   const providers = parsed.providers || {};
+  const cliSection = parsed.cli;
 
-  const findEntry = (entries = []) =>
-    entries.find((entry) => normalizeModels(entry).length > 0);
-
-  // Per architecture §5.11 / M-2: CLI intentionally skips IRC entries so the
-  // IRC tool-free policy does not bleed into the CLI experience.
-  const allEntries = [
-    ...(parsed.slack || []).map((e) => ({ ...e, service: "slack", name: e.name || "slack" })),
-    ...(parsed.discord || []).map((e) => ({ ...e, service: "discord", name: e.name || "discord" }))
-  ];
-
-  const entry = findEntry(allEntries);
-  if (!entry) {
-    throw new Error("No model found in config/services.json");
+  if (!cliSection || typeof cliSection !== "object") {
+    throw new Error("config.cli section is required in config/services.json");
   }
 
-  // Per architecture §5.11 / M-2: imageGeneration precedence for CLI is
-  //   parsed.cli?.imageGeneration
-  //     → parsed.slack[0].imageGeneration
-  //     → parsed.discord[0].imageGeneration
-  // IRC entries are skipped so their tool-free policy doesn't leak into CLI.
-  // Per L-1: strict `=== true` so string "true"/1 do NOT opt in.
-  const firstDefined = (...candidates) =>
-    candidates.find((value) => value !== undefined);
-  const imageGeneration =
-    firstDefined(
-      parsed.cli?.imageGeneration,
-      (parsed.slack || [])[0]?.imageGeneration,
-      (parsed.discord || [])[0]?.imageGeneration
-    ) === true;
+  const models = normalizeModels(cliSection);
+  if (!models.length) {
+    throw new Error("config.cli.model(s) is required");
+  }
 
   return {
-    models: normalizeModels(entry),
+    models,
     providers,
     systemPrompt:
-      typeof entry.systemPrompt === "string" && entry.systemPrompt.trim()
-        ? entry.systemPrompt.trim()
+      typeof cliSection.systemPrompt === "string" && cliSection.systemPrompt.trim()
+        ? cliSection.systemPrompt.trim()
         : undefined,
-    imageGeneration,
-    service: entry.service,
-    name: entry.name
+    webSearch: Boolean(cliSection.webSearch),
+    imageGeneration: cliSection.imageGeneration === true,
+    name: cliSection.name || "cli"
   };
 }
 
@@ -141,14 +183,16 @@ export async function saveCliImages(images, opts = {}) {
 async function main() {
   const rl = readline.createInterface({ input, output });
   const history = [];
+  const codexAuth = await loadCodexAuthFromCodexHome();
   const aiConfig = getAiConfig();
   const cliConfig = await loadCliConfig();
 
   console.log("[cli] chat test interface");
   console.log(`[cli] models=${cliConfig.models.join(",")}`);
-  console.log(`[cli] service=${cliConfig.service}:${cliConfig.name}`);
-  console.log(`[cli] auth_source=${aiConfig.codexAuthSource}`);
+  console.log(`[cli] name=${cliConfig.name}`);
+  console.log(`[cli] auth_source=${codexAuth ? "codex-home" : aiConfig.codexAuthSource}`);
   console.log(`[cli] system_prompt=${cliConfig.systemPrompt ? "service" : "default"}`);
+  console.log(`[cli] web_search=${cliConfig.webSearch ? "on" : "off"}`);
   console.log(`[cli] image_generation=${cliConfig.imageGeneration ? "on" : "off"}`);
   console.log("[cli] /reset to clear context, /exit to quit\n");
 
@@ -184,6 +228,7 @@ async function main() {
           models: cliConfig.models,
           providers: cliConfig.providers,
           systemPrompt: cliConfig.systemPrompt,
+          webSearch: cliConfig.webSearch,
           imageGeneration: imageGenerationEnabled,
           onImage: imageGenerationEnabled
             ? (buffer, meta) => {
@@ -234,6 +279,12 @@ async function main() {
       history.push({ role: "assistant", content: historyAnswer });
     } catch (error) {
       console.error(`assistant> error: ${error.message}\n`);
+    }
+
+    try {
+      await syncCodexAuth(codexAuth);
+    } catch (err) {
+      console.error(`[cli] auth.json 동기화 실패: ${err.message}`);
     }
   }
 

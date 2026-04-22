@@ -141,6 +141,46 @@ test("(D) IRC bot config with imageGeneration: true → parsed (inert, IRC conne
   assert.equal(cfg.irc[0].imageGeneration, true);
 });
 
+test("(D2) CLI config section parsed as a single object with strict imageGeneration", async (t) => {
+  const { file, cleanup } = await writeTempServices({
+    cli: {
+      name: "dev",
+      model: "gpt-5",
+      systemPrompt: "helpful cli",
+      webSearch: true,
+      imageGeneration: true
+    }
+  });
+  t.after(cleanup);
+
+  const cfg = await loadServicesConfig(file);
+  assert.ok(cfg.cli, "cli section should be present");
+  assert.deepEqual(cfg.cli.models, ["gpt-5"]);
+  assert.equal(cfg.cli.systemPrompt, "helpful cli");
+  assert.equal(cfg.cli.webSearch, true);
+  assert.equal(cfg.cli.imageGeneration, true);
+});
+
+test("(D3) CLI config section with imageGeneration: \"true\" → false (strict ===)", async (t) => {
+  const { file, cleanup } = await writeTempServices({
+    cli: { model: "gpt-5", imageGeneration: "true" }
+  });
+  t.after(cleanup);
+
+  const cfg = await loadServicesConfig(file);
+  assert.equal(cfg.cli.imageGeneration, false);
+});
+
+test("(D4) CLI config section absent → cli is null", async (t) => {
+  const { file, cleanup } = await writeTempServices({
+    slack: [{ name: "s", botToken: "t", appToken: "a", model: "gpt-5" }]
+  });
+  t.after(cleanup);
+
+  const cfg = await loadServicesConfig(file);
+  assert.equal(cfg.cli, null);
+});
+
 test("(E) Discord bot config imageGeneration parsing (true / missing / bogus)", async (t) => {
   const { file, cleanup } = await writeTempServices({
     discord: [

@@ -81,6 +81,12 @@ auth:
 #         models: ["claude-sonnet-4-20250514"]
 #         imageGeneration: false
 #     irc: []
+#     cli:
+#       name: dev
+#       model: gpt-5.3-codex
+#       systemPrompt: "You are a helpful CLI assistant."
+#       webSearch: false
+#       imageGeneration: true
 config:
   servicesExistingSecret: ""
 
@@ -94,3 +100,4 @@ config:
     slack: []
     discord: []
     irc: []
+    cli: null
