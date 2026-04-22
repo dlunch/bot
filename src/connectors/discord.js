@@ -1,5 +1,73 @@
-import { Client, GatewayIntentBits, Partials } from "discord.js";
+import { AttachmentBuilder, Client, GatewayIntentBits, Partials } from "discord.js";
 import { createAiResponse } from "../ai.js";
+
+/**
+ * Sanitize a Codex item id so it is safe to use as a filename component.
+ * Only alphanumerics, underscore, and hyphen are preserved. Falsy ids fall
+ * back to the literal string "unknown".
+ */
+export function sanitizeFilenameId(id) {
+  return String(id || "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+/**
+ * Deliver collected images to a Discord channel as new messages. Each image
+ * is sent as its own message so the (optional) revised_prompt maps 1:1 with
+ * the attachment. All sends use `allowedMentions: { parse: [] }` (C-3) so
+ * any `@here`/`@everyone`/user-mention substrings in `revisedPrompt` can
+ * never trigger an actual notification.
+ *
+ * Per-image failures are isolated: the error is logged, a fallback text
+ * message is posted to the same channel, and iteration continues with the
+ * remaining images. A no-op when the images array is empty.
+ *
+ * @param {object} message - The originating Discord message (used for
+ *   `message.channel.send` and as the reply reference so images land in the
+ *   same thread/channel as the text response).
+ * @param {{images: Array<{id: string, buffer: Buffer, revisedPrompt?: string}>}} opts
+ */
+export async function deliverDiscordImages(message, { images } = {}) {
+  if (!Array.isArray(images) || images.length === 0) {
+    return;
+  }
+  const channel = message?.channel;
+  if (!channel || typeof channel.send !== "function") {
+    console.error("[discord][image_upload] missing channel.send; cannot deliver images");
+    return;
+  }
+
+  for (const image of images) {
+    const content =
+      typeof image?.revisedPrompt === "string" ? image.revisedPrompt.trim() : "";
+    const filename = `image-${sanitizeFilenameId(image?.id)}.png`;
+    try {
+      const attachment = new AttachmentBuilder(image.buffer, { name: filename });
+      await channel.send({
+        content,
+        files: [attachment],
+        allowedMentions: { parse: [] },
+        reply: message?.id
+          ? { messageReference: message.id, failIfNotExists: false }
+          : undefined
+      });
+      console.log(`[discord][image_deliver] id=${image?.id}`);
+    } catch (err) {
+      console.error(`[discord][image_upload] failed id=${image?.id}`, err);
+      const reason = err?.message || "unknown";
+      try {
+        await channel.send({
+          content: `⚠️ 이미지 업로드 실패 (id=${image?.id}): ${reason}`,
+          allowedMentions: { parse: [] }
+        });
+      } catch (notifyErr) {
+        console.error(
+          `[discord][image_upload] failure notice also failed id=${image?.id}`,
+          notifyErr
+        );
+      }
+    }
+  }
+}
 
 export async function startDiscordBot(config, options) {
   const { maxThreadHistory, discordStreamUpdateMs } = options;
@@ -98,6 +166,11 @@ export async function startDiscordBot(config, options) {
     let streamedText = "";
     let currentMsgOffset = 0;
     let syncInFlight = Promise.resolve();
+    // Collected image payloads from the AI layer's onImage callback. Buffered
+    // during streaming and delivered after text sync completes so the text
+    // response shows up first (per arch §7.2 UX decision).
+    const collectedImages = [];
+    const imageGenerationEnabled = config.imageGeneration === true;
 
     try {
       try {
@@ -218,6 +291,16 @@ export async function startDiscordBot(config, options) {
         providers: config.providers,
         webSearch: config.webSearch,
         systemPrompt: config.systemPrompt,
+        imageGeneration: imageGenerationEnabled,
+        onImage: imageGenerationEnabled
+          ? (buffer, meta) => {
+              collectedImages.push({
+                id: meta?.id,
+                buffer,
+                revisedPrompt: meta?.revisedPrompt
+              });
+            }
+          : undefined,
         onDelta: async (_delta, fullText) => {
           streamedText = fullText;
           const currentText = streamedText.slice(currentMsgOffset);
@@ -248,7 +331,7 @@ export async function startDiscordBot(config, options) {
         pendingUpdate = null;
       }
 
-      if (!rawAnswer && !streamedText.trim()) {
+      if (!rawAnswer && !streamedText.trim() && collectedImages.length === 0) {
         const modelList = (config.models || []).join(", ") || "(none)";
         console.error(
           `[discord][message] empty response after retries models=${modelList}`
@@ -258,8 +341,50 @@ export async function startDiscordBot(config, options) {
         streamedText = rawAnswer || streamedText;
       }
       await runSyncReply(true);
+
+      // Image delivery (post-text, arch §7.2). If we have images but no text,
+      // post a placeholder message first (M-5) so thread history keeps an
+      // assistant turn for continuity.
+      if (collectedImages.length > 0) {
+        if (!streamedText.trim()) {
+          // H-2: reply w/ messageReference + failIfNotExists:false already
+          // degrades silently when the original message is gone. If the send
+          // still throws (network/rate-limit/perm), fall back to a plain
+          // channel.send so the thread still gets the placeholder row that
+          // buildContext needs for continuity (M-5).
+          try {
+            await message.channel.send({
+              content: "이미지를 생성했습니다.",
+              allowedMentions: { parse: [] },
+              reply: { messageReference: message.id, failIfNotExists: false }
+            });
+          } catch (placeholderErr) {
+            console.error(
+              "[discord][image_placeholder] failed; retrying without reply ref",
+              placeholderErr
+            );
+            try {
+              await message.channel.send({
+                content: "이미지를 생성했습니다.",
+                allowedMentions: { parse: [] }
+              });
+            } catch (retryErr) {
+              console.error(
+                "[discord][image_placeholder] fallback also failed",
+                retryErr
+              );
+            }
+          }
+        }
+        await deliverDiscordImages(message, { images: collectedImages });
+      }
     } catch (error) {
       console.error("[discord][message] error", error);
+      if (collectedImages.length > 0) {
+        console.error(
+          `[discord] dropped ${collectedImages.length} partial images due to stream error`
+        );
+      }
       try {
         if (replyMessage) {
           const errorSuffix = "\n\n⚠️ 출력 중 에러가 발생했습니다.";

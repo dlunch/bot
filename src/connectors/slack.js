@@ -3,6 +3,116 @@ import { createAiResponse } from "../ai.js";
 
 const { App, SocketModeReceiver } = SlackBolt;
 
+/**
+ * Neutralize Slack mention/broadcast tokens that could be injected via
+ * untrusted text (e.g. a model-generated revised_prompt). Strings that are
+ * not strings are returned unchanged so callers can pass through optional
+ * values without branching.
+ *
+ * Tokens handled:
+ *   - Broadcast: <!channel>, <!here>, <!everyone> (optionally with |label)
+ *   - User mention: <@U123456> / <@W123456>
+ *   - Channel mention: <#C123456|name> (C/G/D prefixes)
+ *   - Usergroup mention: <!subteam^S123456|name>
+ *   - Plain text fallback: @channel / @here / @everyone without angle brackets
+ */
+export function sanitizeSlackMentions(text) {
+  if (typeof text !== "string" || !text) {
+    return text;
+  }
+  return text
+    .replace(/<!(channel|here|everyone)(\|[^>]*)?>/gi, "(broadcast removed)")
+    .replace(/<@([UW][A-Z0-9]+)(\|[^>]*)?>/g, "@$1")
+    .replace(/<#([CGD][A-Z0-9]+)(\|[^>]*)?>/g, "#$1")
+    .replace(/<!subteam\^([A-Z0-9]+)(\|[^>]*)?>/g, "@group-$1")
+    .replace(/@(channel|here|everyone)\b/gi, "@\u200b$1");
+}
+
+/**
+ * Sanitize a Codex item id so it is safe to use as a filename component.
+ * Only alphanumerics, underscore, and hyphen are preserved.
+ */
+export function sanitizeFilenameId(id) {
+  return String(id || "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+/**
+ * Upload each collected image to Slack as a new thread message. On per-image
+ * failure the error is logged, a fallback text message is posted into the
+ * same thread, and the loop continues with remaining images. No-op when the
+ * images array is empty.
+ *
+ * @param {object} client - @slack/bolt WebClient (or compatible stub).
+ * @param {Array<{id: string, buffer: Buffer, revisedPrompt?: string}>} images
+ * @param {object} ctx
+ * @param {string} ctx.channelId                - Slack channel id.
+ * @param {string|undefined} ctx.threadTs       - Thread timestamp or undefined.
+ * @param {string} [ctx.source]                 - Event source label for logs.
+ * @param {string} [ctx.name]                   - Bot config name for logs.
+ * @param {Function} [ctx.withRetry]            - Optional retry wrapper.
+ */
+export async function deliverSlackImages(client, images, ctx = {}) {
+  if (!Array.isArray(images) || images.length === 0) {
+    return;
+  }
+  const { channelId, threadTs, source = "image", name = "", withRetry } = ctx;
+  const runWithRetry =
+    typeof withRetry === "function" ? withRetry : async (fn) => fn();
+
+  for (const image of images) {
+    const safeComment = image?.revisedPrompt
+      ? sanitizeSlackMentions(image.revisedPrompt)
+      : undefined;
+    const filename = `image-${sanitizeFilenameId(image?.id)}.png`;
+    try {
+      await runWithRetry(
+        () =>
+          client.filesUploadV2({
+            channel_id: channelId,
+            thread_ts: threadTs,
+            initial_comment: safeComment,
+            file: image.buffer,
+            filename,
+            alt_txt: safeComment
+          }),
+        "files_upload_v2"
+      );
+      console.log(
+        `[slack][image_deliver] name=${name} source=${source} id=${image?.id}`
+      );
+    } catch (err) {
+      console.error(
+        `[slack][image_upload] failed name=${name} source=${source} id=${image?.id}`,
+        err?.data || err
+      );
+      // H-1: image.id originates from the Codex model (trust boundary outside)
+      // and `reason` is a free-form Slack API / HTTP error string. Apply the
+      // same defenses used on success-path initial_comment/alt_txt (C-3) so a
+      // crafted id or error string cannot inject broadcast/user mentions.
+      const safeId = sanitizeFilenameId(image?.id);
+      const safeReason = sanitizeSlackMentions(
+        String(err?.data?.error || err?.message || "unknown")
+      );
+      try {
+        await client.chat.postMessage({
+          channel: channelId,
+          thread_ts: threadTs,
+          text: sanitizeSlackMentions(
+            `⚠️ 이미지 업로드 실패 (id=${safeId}): ${safeReason}`
+          ),
+          parse: "none",
+          mrkdwn: true
+        });
+      } catch (notifyErr) {
+        console.error(
+          `[slack][image_upload] failure notice also failed id=${image?.id}`,
+          notifyErr?.data || notifyErr
+        );
+      }
+    }
+  }
+}
+
 export async function startSlackBot(config, options) {
   const { maxThreadHistory, slackStreamUpdateMs } = options;
   const receiver = new SocketModeReceiver({
@@ -218,6 +328,10 @@ export async function startSlackBot(config, options) {
     let streamedText = "";
     let currentMsgOffset = 0;
     let syncInFlight = Promise.resolve();
+    // Collected image payloads from the AI layer's onImage callback. These
+    // are buffered during streaming and delivered after text sync completes.
+    const collectedImages = [];
+    const imageGenerationEnabled = config.imageGeneration === true;
 
     try {
       try {
@@ -367,6 +481,16 @@ export async function startSlackBot(config, options) {
         providers: config.providers,
         webSearch: config.webSearch,
         systemPrompt: config.systemPrompt,
+        imageGeneration: imageGenerationEnabled,
+        onImage: imageGenerationEnabled
+          ? (buffer, meta) => {
+              collectedImages.push({
+                id: meta?.id,
+                buffer,
+                revisedPrompt: meta?.revisedPrompt
+              });
+            }
+          : undefined,
         onDelta: async (_delta, fullText) => {
           streamedText = fullText;
           const currentText = streamedText.slice(currentMsgOffset);
@@ -397,7 +521,7 @@ export async function startSlackBot(config, options) {
         pendingUpdate = null;
       }
 
-      if (!rawAnswer && !streamedText.trim()) {
+      if (!rawAnswer && !streamedText.trim() && collectedImages.length === 0) {
         const modelList = (config.models || []).join(", ") || "(none)";
         console.error(
           `[slack][${source}] empty response after retries models=${modelList}`
@@ -408,8 +532,53 @@ export async function startSlackBot(config, options) {
       }
       await runSyncReply(true);
 
+      // Image delivery (M-5 + §6.2 E8): if we collected images during the
+      // stream, post them AFTER the text reply has been synced. If there was
+      // no text at all, post a small placeholder message first so the thread
+      // history still contains an assistant turn for the next round of
+      // buildThreadContext to pick up.
+      if (collectedImages.length > 0) {
+        const uploadThreadTs = event.thread_ts || undefined;
+        if (!streamedText.trim()) {
+          try {
+            await withSlackRetry(
+              () =>
+                client.chat.postMessage({
+                  channel: event.channel,
+                  thread_ts: uploadThreadTs,
+                  text: "이미지를 생성했습니다.",
+                  parse: "none",
+                  mrkdwn: true
+                }),
+              "image_placeholder"
+            );
+          } catch (placeholderErr) {
+            console.error(
+              `[slack][image_placeholder] failed name=${config.name}`,
+              placeholderErr?.data || placeholderErr
+            );
+          }
+        }
+        await deliverSlackImages(client, collectedImages, {
+          channelId: event.channel,
+          threadTs: uploadThreadTs,
+          source,
+          name: config.name,
+          withRetry: withSlackRetry
+        });
+      }
+
     } catch (error) {
       console.error(`[slack][${source}] error`, error);
+      if (collectedImages.length > 0) {
+        // Drop partially-collected images on stream error (H-2). We only log
+        // the count so operators can correlate with upstream issues; we do
+        // not upload the fragments because mixing a failure notice with a
+        // subset of images harms UX and thread-history continuity.
+        console.error(
+          `[slack] dropped ${collectedImages.length} partial images due to stream error name=${config.name} source=${source}`
+        );
+      }
       if (replyTs) {
         const errorSuffix = "\n\n⚠️ 출력 중 에러가 발생했습니다.";
         let errorText;

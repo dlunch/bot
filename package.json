@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "chat": "node src/cli.js"
+    "chat": "node src/cli.js",
+    "test": "node --test tests/*.test.js"
   },
   "dependencies": {
     "@slack/bolt": "^4.6.0",

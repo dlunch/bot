@@ -322,7 +322,7 @@ function parseSseResponse(raw) {
   return deltaText.trim() || fallbackText.trim();
 }
 
-async function parseCodexSseStream(stream, onDelta) {
+async function parseCodexSseStream(stream, onDelta, onImage) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -361,6 +361,50 @@ async function parseCodexSseStream(stream, onDelta) {
       if (onDelta) {
         await onDelta(event.delta, deltaText);
       }
+      return;
+    }
+
+    // image_generation_call: must be evaluated BEFORE text fallback extraction so
+    // image events are not mistakenly picked up as text output.
+    if (
+      event?.type === "response.output_item.done" &&
+      event.item?.type === "image_generation_call"
+    ) {
+      if (
+        event.item?.status === "completed" &&
+        typeof event.item?.result === "string" &&
+        event.item.result
+      ) {
+        // Buffer.from(string, "base64") never throws — invalid chars are
+        // silently dropped, which yields an empty buffer for fully-garbage
+        // input. The typeof guard above also rules out non-string inputs that
+        // could trigger a throw. So a catch is unnecessary; the length check
+        // below is the only signal of decode trouble we can observe here.
+        const imageBuffer = Buffer.from(event.item.result, "base64");
+
+        if (imageBuffer.length === 0) {
+          console.warn(
+            `[ai][image] decoded empty buffer (likely invalid base64) id=${event.item.id}`
+          );
+          return;
+        }
+
+        if (typeof onImage === "function") {
+          const revisedPrompt =
+            typeof event.item.revised_prompt === "string"
+              ? event.item.revised_prompt.trim() || undefined
+              : undefined;
+          try {
+            await onImage(imageBuffer, { id: event.item.id, revisedPrompt });
+          } catch (cbErr) {
+            console.error(
+              `[ai][image] onImage callback threw id=${event.item.id}`,
+              cbErr
+            );
+          }
+        }
+      }
+      // Consume this event; do NOT fall through to the text fallback extraction.
       return;
     }
 
@@ -495,7 +539,7 @@ function resolveProvider(model, providers) {
   return "codex";
 }
 
-async function callCodex(model, context, systemPrompt, webSearch, onDelta) {
+async function callCodex(model, context, systemPrompt, webSearch, onDelta, options = {}) {
   const auth = await getCodexAuthState();
   if (!auth) {
     throw new Error("Codex provider is not configured (CODEX_REFRESH_TOKEN missing)");
@@ -513,8 +557,17 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta) {
     stream: true
   };
 
-  if (webSearch) {
-    body.tools = [{ type: "web_search" }];
+  const imageGeneration = options?.imageGeneration === true;
+
+  if (webSearch || imageGeneration) {
+    const tools = [];
+    if (webSearch) {
+      tools.push({ type: "web_search" });
+    }
+    if (imageGeneration) {
+      tools.push({ type: "image_generation", output_format: "png" });
+    }
+    body.tools = tools;
   }
 
   let res = await requestCodexResponse(body, auth);
@@ -533,8 +586,10 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta) {
     throw new Error(`Codex request failed (model=${model}): ${extractErrorDetail(raw, parseJson(raw))}`);
   }
 
+  const onImage = typeof options?.onImage === "function" ? options.onImage : undefined;
+
   if (res.body) {
-    return parseCodexSseStream(res.body, onDelta);
+    return parseCodexSseStream(res.body, onDelta, onImage);
   }
 
   const raw = await res.text();
@@ -605,6 +660,8 @@ async function callAnthropic(model, context, systemPrompt, onDelta) {
 
 export async function createAiResponse(context, options = {}) {
   const { onDelta, webSearch, providers } = options;
+  const imageGeneration = options.imageGeneration === true;
+  const userOnImage = typeof options.onImage === "function" ? options.onImage : undefined;
 
   const models =
     Array.isArray(options.models) && options.models.length > 0
@@ -626,19 +683,38 @@ export async function createAiResponse(context, options = {}) {
     ? Math.max(0, Number(options.emptyRetryCount))
     : 2;
 
+  let imageCount = 0;
+  const wrappedOnImage = (buffer, meta) => {
+    imageCount++;
+    if (userOnImage) {
+      return userOnImage(buffer, meta);
+    }
+    return undefined;
+  };
+
   let lastError;
   for (const model of models) {
     const provider = resolveProvider(model, providers);
     let movedToNextModel = false;
 
+    if (imageGeneration && provider === "anthropic") {
+      console.warn(
+        `[ai] imageGeneration ignored for anthropic provider model=${model}`
+      );
+    }
+
     for (let attempt = 0; attempt <= emptyRetryCount; attempt++) {
+      imageCount = 0;
       try {
         const result = provider === "anthropic"
           ? await callAnthropic(model, context, systemPrompt, onDelta)
-          : await callCodex(model, context, systemPrompt, webSearch, onDelta);
+          : await callCodex(model, context, systemPrompt, webSearch, onDelta, {
+              imageGeneration,
+              onImage: wrappedOnImage
+            });
 
-        if (result) {
-          return result;
+        if (result || imageCount > 0) {
+          return result || "";
         }
 
         console.warn(
@@ -676,3 +752,9 @@ export function getAiConfig() {
     hasAnthropicKey: Boolean(readOptionalEnv("ANTHROPIC_API_KEY"))
   };
 }
+
+// Internal helpers exported for unit tests only. Do not consume from production code.
+export const __testing__ = {
+  parseCodexSseStream,
+  callCodex
+};

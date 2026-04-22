@@ -105,21 +105,51 @@ Kubernetes처럼 재시작이 발생하는 환경에서는 refresh token이 1회
   - `MESSAGE CONTENT` 활성화
 - OAuth2에서 봇을 서버에 초대
 
-## 5) IRC 준비
+## 5) 이미지 생성 (옵션)
+
+Slack / Discord / CLI 봇은 Codex의 `image_generation` 내장 툴을 사용해 이미지를 생성할 수 있습니다. 봇별 설정에 `imageGeneration: true`를 추가하면 모델이 대화 맥락에 따라 이미지 생성 여부를 직접 결정합니다. 예를 들어 "고양이 그려줘" 같은 요청에는:
+
+- Slack / Discord: 스트리밍이 끝난 뒤 같은 스레드/채널에 PNG 파일을 새 메시지로 첨부하고, `revised_prompt`를 메시지 본문으로 노출합니다.
+- CLI: 현재 작업 디렉토리에 `image-<YYYYMMDD>-<HHMMSS>[-<index>].png` 형식으로 저장하고 경로를 stdout에 출력합니다.
+
+주의 사항:
+
+- `imageGeneration`은 Boolean literal(`true` / `false`)만 받습니다. 문자열 `"true"`는 false로 처리됩니다(strict `=== true` 비교).
+- 생략하거나 `false`이면 기존 텍스트 응답 페이로드와 바이트 레벨로 동일하게 동작합니다(회귀 없음).
+- IRC는 파일 첨부가 불가능하여 이 플래그를 설정해도 무시됩니다.
+- Anthropic provider 경로에서는 플래그가 무시되며 기동 시 `[ai] imageGeneration ignored for anthropic provider ...` 형태의 warn 로그가 한 번 남습니다.
+
+예시(`config/services.json`):
+
+```json
+{
+  "slack": [
+    {
+      "name": "main",
+      "botToken": "xoxb-...",
+      "appToken": "xapp-...",
+      "model": "gpt-5.3-codex",
+      "imageGeneration": true
+    }
+  ]
+}
+```
+
+## 6) IRC 준비
 
 - IRC 서버 주소/포트와 봇 계정(nick) 준비
 - SSL/TLS 서버면 `ssl: true`와 `port: 6697` 사용 (`tls` 키도 호환)
 - SASL 사용 시 `sasl.enabled: true`, `sasl.mechanism: PLAIN`, `sasl.username/password` 설정
 - 응답할 채널 목록을 `channels`에 설정
 
-## 6) 실행
+## 7) 실행
 
 ```bash
 export CODEX_REFRESH_TOKEN=your_codex_refresh_token
 npm run start
 ```
 
-## 7) Docker 빌드/실행
+## 8) Docker 빌드/실행
 
 ```bash
 docker build -t slack-openai-bot .
@@ -129,7 +159,7 @@ docker run --rm \
   slack-openai-bot
 ```
 
-## 8) Helm 배포
+## 9) Helm 배포
 
 차트 경로: `helm/slack-openai-bot`
 

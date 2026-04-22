@@ -1,18 +1,19 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import url from "node:url";
 import { getAiConfig } from "./ai.js";
 import { startSlackBot } from "./connectors/slack.js";
 import { startDiscordBot } from "./connectors/discord.js";
 import { startIrcBot } from "./connectors/irc.js";
 
-const servicesFile = path.join(process.cwd(), "config", "services.json");
+const defaultServicesFile = path.join(process.cwd(), "config", "services.json");
 
 const maxThreadHistory = Number(process.env.MAX_THREAD_HISTORY || 20);
 const slackStreamUpdateMs = Number(process.env.SLACK_STREAM_UPDATE_MS || 800);
 const discordStreamUpdateMs = Number(process.env.DISCORD_STREAM_UPDATE_MS || 800);
 
-async function loadServicesConfig() {
-  const content = await fs.readFile(servicesFile, "utf8");
+export async function loadServicesConfig(filePath = defaultServicesFile) {
+  const content = await fs.readFile(filePath, "utf8");
   const parsed = JSON.parse(content);
   const normalizeOptionalString = (value) => {
     if (typeof value !== "string") {
@@ -35,6 +36,11 @@ async function loadServicesConfig() {
     return [];
   };
 
+  // Per architecture §5.11 / L-1: strict `=== true` so that truthy non-boolean
+  // values (e.g. the string "true", or 1) do NOT opt into image generation.
+  // This is also why we don't reuse `Boolean(...)` like `webSearch` does.
+  const parseImageGeneration = (entry) => entry?.imageGeneration === true;
+
   const slack = (parsed.slack || []).map((entry) => ({
     name: entry.name || "slack",
     botToken: entry.botToken,
@@ -42,6 +48,7 @@ async function loadServicesConfig() {
     models: normalizeModels(entry),
     providers,
     webSearch: Boolean(entry.webSearch),
+    imageGeneration: parseImageGeneration(entry),
     systemPrompt: normalizeOptionalString(entry.systemPrompt)
   }));
 
@@ -51,6 +58,7 @@ async function loadServicesConfig() {
     models: normalizeModels(entry),
     providers,
     webSearch: Boolean(entry.webSearch),
+    imageGeneration: parseImageGeneration(entry),
     systemPrompt: normalizeOptionalString(entry.systemPrompt)
   }));
 
@@ -82,6 +90,10 @@ async function loadServicesConfig() {
     models: normalizeModels(entry),
     providers,
     webSearch: Boolean(entry.webSearch),
+    // IRC normalizes the field for config-shape consistency but the IRC
+    // connector never forwards it to `createAiResponse` — it is an inert
+    // field (see architecture.md §4 and PRD F5).
+    imageGeneration: parseImageGeneration(entry),
     systemPrompt: normalizeOptionalString(entry.systemPrompt),
     maxMessageLength: entry.maxMessageLength,
     connectTimeoutMs: entry.connectTimeoutMs
@@ -144,7 +156,7 @@ function assertIrcConfig(config) {
   }
 }
 
-(async () => {
+async function main() {
   const stopHandlers = [];
   const shutdownTimeoutMs = Number(process.env.SHUTDOWN_TIMEOUT_MS || 10000);
   let isShuttingDown = false;
@@ -234,4 +246,19 @@ function assertIrcConfig(config) {
   console.log(
     `[server] services started slack=${slackBots.length} discord=${discordBots.length} irc=${ircBots.length} codex=${ai.hasRefreshToken} anthropic=${ai.hasAnthropicKey}`
   );
+}
+
+// Only auto-start when invoked directly (`node src/index.js`). Tests and
+// ad-hoc imports (e.g. `node -e "import('./src/index.js')"`) just get the
+// exported helpers — the bot does not connect to anything on import.
+const isMain = (() => {
+  try {
+    return import.meta.url === url.pathToFileURL(process.argv[1]).href;
+  } catch {
+    return false;
+  }
 })();
+
+if (isMain) {
+  await main();
+}
