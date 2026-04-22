@@ -290,17 +290,28 @@ export async function startIrcBot(config, options) {
       const context = [...getHistory(conversationKey), { role: "user", content: userContent }];
 
       try {
-        const answer =
-          (await createAiResponse(context, {
-            models: config.models,
-            providers: config.providers,
-            webSearch: config.webSearch,
-            systemPrompt: config.systemPrompt
-          })) || "응답을 생성하지 못했어요.";
+        const rawAnswer = await createAiResponse(context, {
+          models: config.models,
+          providers: config.providers,
+          webSearch: config.webSearch,
+          systemPrompt: config.systemPrompt
+        });
+
+        if (!rawAnswer) {
+          const modelList = (config.models || []).join(", ") || "(none)";
+          console.error(
+            `[irc][message] empty response after retries name=${config.name} target=${replyTarget} models=${modelList}`
+          );
+          sendMessage(
+            replyTarget,
+            `응답을 생성하지 못했어요 (모델 ${modelList}에서 빈 응답 반환). 잠시 후 다시 시도해주세요.`
+          );
+          return;
+        }
 
         appendHistory(conversationKey, { role: "user", content: userContent });
-        appendHistory(conversationKey, { role: "assistant", content: answer });
-        sendMessage(replyTarget, answer);
+        appendHistory(conversationKey, { role: "assistant", content: rawAnswer });
+        sendMessage(replyTarget, rawAnswer);
       } catch (error) {
         console.error(`[irc][message] error name=${config.name} target=${replyTarget}`, error);
         sendMessage(replyTarget, "에러가 발생했습니다. 잠시 후 다시 시도해주세요.");

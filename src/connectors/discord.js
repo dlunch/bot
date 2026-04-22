@@ -213,43 +213,50 @@ export async function startDiscordBot(config, options) {
         }, discordStreamUpdateMs);
       };
 
-      const answer =
-        (await createAiResponse(context, {
-          models: config.models,
-          providers: config.providers,
-          webSearch: config.webSearch,
-          systemPrompt: config.systemPrompt,
-          onDelta: async (_delta, fullText) => {
-            streamedText = fullText;
-            const currentText = streamedText.slice(currentMsgOffset);
+      const rawAnswer = await createAiResponse(context, {
+        models: config.models,
+        providers: config.providers,
+        webSearch: config.webSearch,
+        systemPrompt: config.systemPrompt,
+        onDelta: async (_delta, fullText) => {
+          streamedText = fullText;
+          const currentText = streamedText.slice(currentMsgOffset);
 
-            if (!replyMessage || currentText.length > discordMaxLength) {
-              if (pendingUpdate) {
-                clearTimeout(pendingUpdate);
-                pendingUpdate = null;
-              }
-              await runSyncReply(true);
-              return;
+          if (!replyMessage || currentText.length > discordMaxLength) {
+            if (pendingUpdate) {
+              clearTimeout(pendingUpdate);
+              pendingUpdate = null;
             }
-
-            if (Date.now() - lastUpdateAt >= discordStreamUpdateMs) {
-              if (pendingUpdate) {
-                clearTimeout(pendingUpdate);
-                pendingUpdate = null;
-              }
-              await runSyncReply(true);
-            } else {
-              scheduleUpdate();
-            }
+            await runSyncReply(true);
+            return;
           }
-        })) || "응답을 생성하지 못했어요.";
+
+          if (Date.now() - lastUpdateAt >= discordStreamUpdateMs) {
+            if (pendingUpdate) {
+              clearTimeout(pendingUpdate);
+              pendingUpdate = null;
+            }
+            await runSyncReply(true);
+          } else {
+            scheduleUpdate();
+          }
+        }
+      });
 
       if (pendingUpdate) {
         clearTimeout(pendingUpdate);
         pendingUpdate = null;
       }
 
-      streamedText = answer || streamedText || "응답을 생성하지 못했어요.";
+      if (!rawAnswer && !streamedText.trim()) {
+        const modelList = (config.models || []).join(", ") || "(none)";
+        console.error(
+          `[discord][message] empty response after retries models=${modelList}`
+        );
+        streamedText = `응답을 생성하지 못했어요 (모델 ${modelList}에서 빈 응답 반환). 잠시 후 다시 시도해주세요.`;
+      } else {
+        streamedText = rawAnswer || streamedText;
+      }
       await runSyncReply(true);
     } catch (error) {
       console.error("[discord][message] error", error);

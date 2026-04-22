@@ -622,25 +622,41 @@ export async function createAiResponse(context, options = {}) {
       ? options.systemPrompt.trim()
       : defaultSystemPrompt;
 
+  const emptyRetryCount = Number.isFinite(Number(options.emptyRetryCount))
+    ? Math.max(0, Number(options.emptyRetryCount))
+    : 2;
+
   let lastError;
   for (const model of models) {
     const provider = resolveProvider(model, providers);
+    let movedToNextModel = false;
 
-    try {
-      const result = provider === "anthropic"
-        ? await callAnthropic(model, context, systemPrompt, onDelta)
-        : await callCodex(model, context, systemPrompt, webSearch, onDelta);
+    for (let attempt = 0; attempt <= emptyRetryCount; attempt++) {
+      try {
+        const result = provider === "anthropic"
+          ? await callAnthropic(model, context, systemPrompt, onDelta)
+          : await callCodex(model, context, systemPrompt, webSearch, onDelta);
 
-      if (result) {
-        return result;
+        if (result) {
+          return result;
+        }
+
+        console.warn(
+          `[ai] empty response from provider=${provider} model=${model} attempt=${attempt + 1}/${emptyRetryCount + 1}`
+        );
+      } catch (error) {
+        lastError = error;
+        if (error instanceof RateLimitError && models.indexOf(model) < models.length - 1) {
+          console.warn(`[ai] ${error.message}, falling back to next model`);
+          movedToNextModel = true;
+          break;
+        }
+        throw error;
       }
-    } catch (error) {
-      lastError = error;
-      if (error instanceof RateLimitError && models.indexOf(model) < models.length - 1) {
-        console.warn(`[ai] ${error.message}, falling back to next model`);
-        continue;
-      }
-      throw error;
+    }
+
+    if (movedToNextModel) {
+      continue;
     }
   }
 

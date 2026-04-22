@@ -362,43 +362,50 @@ export async function startSlackBot(config, options) {
         }, slackStreamUpdateMs);
       };
 
-      const answer =
-        (await createAiResponse(context, {
-          models: config.models,
-          providers: config.providers,
-          webSearch: config.webSearch,
-          systemPrompt: config.systemPrompt,
-          onDelta: async (_delta, fullText) => {
-            streamedText = fullText;
-            const currentText = streamedText.slice(currentMsgOffset);
+      const rawAnswer = await createAiResponse(context, {
+        models: config.models,
+        providers: config.providers,
+        webSearch: config.webSearch,
+        systemPrompt: config.systemPrompt,
+        onDelta: async (_delta, fullText) => {
+          streamedText = fullText;
+          const currentText = streamedText.slice(currentMsgOffset);
 
-            if (!replyTs || currentText.length > slackMaxLength) {
-              if (pendingUpdate) {
-                clearTimeout(pendingUpdate);
-                pendingUpdate = null;
-              }
-              await runSyncReply(true);
-              return;
+          if (!replyTs || currentText.length > slackMaxLength) {
+            if (pendingUpdate) {
+              clearTimeout(pendingUpdate);
+              pendingUpdate = null;
             }
-
-            if (Date.now() - lastUpdateAt >= slackStreamUpdateMs) {
-              if (pendingUpdate) {
-                clearTimeout(pendingUpdate);
-                pendingUpdate = null;
-              }
-              await runSyncReply(true);
-            } else {
-              scheduleUpdate();
-            }
+            await runSyncReply(true);
+            return;
           }
-        })) || "응답을 생성하지 못했어요.";
+
+          if (Date.now() - lastUpdateAt >= slackStreamUpdateMs) {
+            if (pendingUpdate) {
+              clearTimeout(pendingUpdate);
+              pendingUpdate = null;
+            }
+            await runSyncReply(true);
+          } else {
+            scheduleUpdate();
+          }
+        }
+      });
 
       if (pendingUpdate) {
         clearTimeout(pendingUpdate);
         pendingUpdate = null;
       }
 
-      streamedText = answer || streamedText || "응답을 생성하지 못했어요.";
+      if (!rawAnswer && !streamedText.trim()) {
+        const modelList = (config.models || []).join(", ") || "(none)";
+        console.error(
+          `[slack][${source}] empty response after retries models=${modelList}`
+        );
+        streamedText = `응답을 생성하지 못했어요 (모델 ${modelList}에서 빈 응답 반환). 잠시 후 다시 시도해주세요.`;
+      } else {
+        streamedText = rawAnswer || streamedText;
+      }
       await runSyncReply(true);
 
     } catch (error) {
