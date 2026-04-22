@@ -116,11 +116,19 @@ export async function deliverSlackImages(client, images, ctx = {}) {
 export async function startSlackBot(config, options) {
   const { maxThreadHistory, slackStreamUpdateMs } = options;
   const receiver = new SocketModeReceiver({
-    appToken: config.appToken,
-    pingPongLoggingEnabled: false,
-    clientPingTimeoutMS: 30_000,
-    serverPingTimeoutMS: 30_000
+    appToken: config.appToken
   });
+
+  // @slack/bolt v4.6 SocketModeReceiver ignores clientPingTimeout / serverPingTimeout
+  // options (only appToken/logger/logLevel/clientOptions are forwarded to
+  // SocketModeClient). Default clientPingTimeoutMS is 5000ms, which fires noisy
+  // "pong wasn't received" warnings on slow startups/networks. Patch the
+  // underlying SocketModeClient instance before start so the overrides land on
+  // the websocket constructor. 30s matches what we originally intended.
+  if (receiver.client) {
+    receiver.client.clientPingTimeoutMS = 30_000;
+    receiver.client.serverPingTimeoutMS = 30_000;
+  }
 
   const app = new App({
     token: config.botToken,
