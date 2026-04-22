@@ -112,6 +112,7 @@ Kubernetes처럼 재시작이 발생하는 환경에서는 refresh token이 1회
   - `reactions:write`
   - `channels:history`
   - `im:history`
+  - `files:write` (이미지 생성 기능 사용 시 필수 — 없으면 `missing_scope` 에러)
 - Event Subscriptions
   - `app_mention`
   - `message.channels`
@@ -135,6 +136,7 @@ Slack / Discord / CLI 봇은 Codex의 `image_generation` 내장 툴을 사용해
 
 주의 사항:
 
+- Slack에서 이미지 첨부를 사용하려면 `files:write` OAuth scope가 Bot Token Scopes에 추가되어 있어야 합니다. 없으면 업로드 시 `missing_scope` 에러가 발생합니다.
 - `imageGeneration`은 Boolean literal(`true` / `false`)만 받습니다. 문자열 `"true"`는 false로 처리됩니다(strict `=== true` 비교).
 - 생략하거나 `false`이면 기존 텍스트 응답 페이로드와 바이트 레벨로 동일하게 동작합니다(회귀 없음).
 - IRC는 파일 첨부가 불가능하여 이 플래그를 설정해도 무시됩니다.

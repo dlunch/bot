@@ -573,7 +573,12 @@ export async function startSlackBot(config, options) {
       // history still contains an assistant turn for the next round of
       // buildThreadContext to pick up.
       if (collectedImages.length > 0) {
-        const uploadThreadTs = event.thread_ts || undefined;
+        // In channels (and in thread replies), always anchor to the thread so
+        // the placeholder + image attachments stay grouped with the original
+        // question. In DMs with no thread context, post at the DM root like
+        // the text reply does. Mirrors the `inDm ? {} : { thread_ts }` pattern
+        // used for text replies elsewhere in this file.
+        const uploadThreadTs = inDm ? undefined : threadTs;
         if (!streamedText.trim()) {
           try {
             await withSlackRetry(
