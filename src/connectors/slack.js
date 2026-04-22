@@ -332,6 +332,7 @@ export async function startSlackBot(config, options) {
     // are buffered during streaming and delivered after text sync completes.
     const collectedImages = [];
     const imageGenerationEnabled = config.imageGeneration === true;
+    let imageProgressNoticeTs = null;
 
     try {
       try {
@@ -491,6 +492,32 @@ export async function startSlackBot(config, options) {
               });
             }
           : undefined,
+        onImageEvent: imageGenerationEnabled
+          ? async (evt) => {
+              if (!evt?.firstEventInAttempt || imageProgressNoticeTs) {
+                return;
+              }
+              try {
+                const res = await withSlackRetry(
+                  () =>
+                    client.chat.postMessage({
+                      channel: event.channel,
+                      thread_ts: threadTs,
+                      text: "🎨 이미지 생성 중...",
+                      parse: "none",
+                      mrkdwn: true
+                    }),
+                  "image_progress_notice"
+                );
+                imageProgressNoticeTs = res?.ts;
+              } catch (err) {
+                console.error(
+                  `[slack][image_progress] failed name=${config.name} source=${source}`,
+                  err?.data || err
+                );
+              }
+            }
+          : undefined,
         onDelta: async (_delta, fullText) => {
           streamedText = fullText;
           const currentText = streamedText.slice(currentMsgOffset);
@@ -568,6 +595,25 @@ export async function startSlackBot(config, options) {
         });
       }
 
+      if (imageProgressNoticeTs) {
+        try {
+          await withSlackRetry(
+            () =>
+              client.chat.delete({
+                channel: event.channel,
+                ts: imageProgressNoticeTs
+              }),
+            "image_progress_cleanup"
+          );
+        } catch (err) {
+          console.error(
+            `[slack][image_progress] cleanup failed name=${config.name}`,
+            err?.data || err
+          );
+        }
+        imageProgressNoticeTs = null;
+      }
+
     } catch (error) {
       console.error(`[slack][${source}] error`, error);
       if (collectedImages.length > 0) {
@@ -631,6 +677,24 @@ export async function startSlackBot(config, options) {
       if (pendingUpdate) {
         clearTimeout(pendingUpdate);
         pendingUpdate = null;
+      }
+
+      if (imageProgressNoticeTs) {
+        try {
+          await withSlackRetry(
+            () =>
+              client.chat.delete({
+                channel: event.channel,
+                ts: imageProgressNoticeTs
+              }),
+            "image_progress_cleanup"
+          );
+        } catch (err) {
+          console.error(
+            `[slack][image_progress] cleanup failed (finally) name=${config.name}`,
+            err?.data || err
+          );
+        }
       }
 
       if (addedEyesReaction) {

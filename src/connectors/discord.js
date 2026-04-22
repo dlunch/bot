@@ -171,6 +171,7 @@ export async function startDiscordBot(config, options) {
     // response shows up first (per arch §7.2 UX decision).
     const collectedImages = [];
     const imageGenerationEnabled = config.imageGeneration === true;
+    let imageProgressMessage = null;
 
     try {
       try {
@@ -301,6 +302,24 @@ export async function startDiscordBot(config, options) {
               });
             }
           : undefined,
+        onImageEvent: imageGenerationEnabled
+          ? async (evt) => {
+              if (!evt?.firstEventInAttempt || imageProgressMessage) {
+                return;
+              }
+              try {
+                imageProgressMessage = await message.channel.send({
+                  content: "🎨 이미지 생성 중...",
+                  allowedMentions: { parse: [] },
+                  reply: message?.id
+                    ? { messageReference: message.id, failIfNotExists: false }
+                    : undefined
+                });
+              } catch (err) {
+                console.error("[discord][image_progress] failed", err);
+              }
+            }
+          : undefined,
         onDelta: async (_delta, fullText) => {
           streamedText = fullText;
           const currentText = streamedText.slice(currentMsgOffset);
@@ -378,6 +397,15 @@ export async function startDiscordBot(config, options) {
         }
         await deliverDiscordImages(message, { images: collectedImages });
       }
+
+      if (imageProgressMessage) {
+        try {
+          await imageProgressMessage.delete();
+        } catch (err) {
+          console.error("[discord][image_progress] cleanup failed", err);
+        }
+        imageProgressMessage = null;
+      }
     } catch (error) {
       console.error("[discord][message] error", error);
       if (collectedImages.length > 0) {
@@ -413,6 +441,14 @@ export async function startDiscordBot(config, options) {
       if (pendingUpdate) {
         clearTimeout(pendingUpdate);
         pendingUpdate = null;
+      }
+
+      if (imageProgressMessage) {
+        try {
+          await imageProgressMessage.delete();
+        } catch (err) {
+          console.error("[discord][image_progress] cleanup failed (finally)", err);
+        }
       }
 
       if (addedReaction) {

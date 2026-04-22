@@ -239,6 +239,17 @@ async function main() {
                 });
               }
             : undefined,
+          onImageEvent: imageGenerationEnabled
+            ? (evt) => {
+                if (evt?.firstEventInAttempt) {
+                  if (started) {
+                    process.stdout.write("\n");
+                  }
+                  process.stdout.write("[이미지 생성 중...]\n");
+                  started = false;
+                }
+              }
+            : undefined,
           onDelta: (delta) => {
             if (!delta) {
               return;

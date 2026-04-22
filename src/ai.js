@@ -689,6 +689,8 @@ export async function createAiResponse(context, options = {}) {
   const { onDelta, webSearch, providers } = options;
   const imageGeneration = options.imageGeneration === true;
   const userOnImage = typeof options.onImage === "function" ? options.onImage : undefined;
+  const userOnImageEvent =
+    typeof options.onImageEvent === "function" ? options.onImageEvent : undefined;
 
   const models =
     Array.isArray(options.models) && options.models.length > 0
@@ -719,15 +721,23 @@ export async function createAiResponse(context, options = {}) {
     }
     return undefined;
   };
-  const onImageEvent = (evt) => {
+  const onImageEvent = async (evt) => {
     // Any lifecycle event (in_progress, generating, partial_image, completed)
     // means the server is actively generating — log once per attempt so users
     // know the long wait is real work, and use the flag to differentiate the
     // retry warning below.
-    if (!imageActivity) {
+    const firstEventInAttempt = !imageActivity;
+    if (firstEventInAttempt) {
       console.log(`[ai] image generation in progress... (${evt?.type})`);
     }
     imageActivity = true;
+    if (userOnImageEvent) {
+      try {
+        await userOnImageEvent({ ...evt, firstEventInAttempt });
+      } catch (cbErr) {
+        console.error(`[ai] user onImageEvent threw`, cbErr);
+      }
+    }
   };
 
   let lastError;
