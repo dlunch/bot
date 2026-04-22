@@ -31,7 +31,3 @@ pnpm-debug.log*
 # temp
 *.tmp
 *.swp
-
-# forge pipeline artifacts (kept on disk, not tracked)
-docs/forge/
-docs/plans/
