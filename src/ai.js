@@ -334,6 +334,8 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent) {
   let buffer = "";
   let deltaText = "";
   let fallbackText = "";
+  const debug = process.env.CODEX_SSE_DEBUG === "1";
+  let chunkIndex = 0;
 
   const handleEventBlock = async (block) => {
     const lines = block.split("\n");
@@ -359,7 +361,16 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent) {
     try {
       event = JSON.parse(data);
     } catch {
+      if (debug) {
+        process.stderr.write(`[codex-sse][event_parse_fail] ${JSON.stringify(data)}\n`);
+      }
       return;
+    }
+
+    if (debug) {
+      process.stderr.write(
+        `[codex-sse][event] type=${event?.type} keys=${Object.keys(event || {}).join(",")}\n`
+      );
     }
 
     if (event?.type === "response.output_text.delta" && typeof event.delta === "string") {
@@ -388,16 +399,15 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent) {
     }
 
     // image_generation_call: must be evaluated BEFORE text fallback extraction so
-    // image events are not mistakenly picked up as text output.
+    // image events are not mistakenly picked up as text output. We gate only on
+    // the presence of a non-empty `result` string (the base64 payload) — status
+    // values vary across backend versions (`completed`, `done`, etc.) and are
+    // not reliable discriminators.
     if (
       event?.type === "response.output_item.done" &&
       event.item?.type === "image_generation_call"
     ) {
-      if (
-        event.item?.status === "completed" &&
-        typeof event.item?.result === "string" &&
-        event.item.result
-      ) {
+      if (typeof event.item?.result === "string" && event.item.result) {
         // Buffer.from(string, "base64") never throws — invalid chars are
         // silently dropped, which yields an empty buffer for fully-garbage
         // input. The typeof guard above also rules out non-string inputs that
@@ -426,6 +436,10 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent) {
             );
           }
         }
+      } else if (debug) {
+        process.stderr.write(
+          `[codex-sse][image_done_no_result] status=${event.item?.status} keys=${Object.keys(event.item || {}).join(",")}\n`
+        );
       }
       // Consume this event; do NOT fall through to the text fallback extraction.
       return;
@@ -437,28 +451,64 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent) {
     }
   };
 
+  const findBlockSeparator = (text) => {
+    // SSE separates events with a blank line which can be \n\n, \r\n\r\n, or \r\r.
+    // Return the earliest match and its length so we can advance past it.
+    let best = -1;
+    let len = 0;
+    const check = (needle) => {
+      const idx = text.indexOf(needle);
+      if (idx !== -1 && (best === -1 || idx < best)) {
+        best = idx;
+        len = needle.length;
+      }
+    };
+    check("\r\n\r\n");
+    check("\n\n");
+    check("\r\r");
+    return best === -1 ? null : { index: best, length: len };
+  };
+
   while (true) {
     const { value, done } = await reader.read();
     if (done) {
       break;
     }
 
-    buffer += decoder.decode(value, { stream: true });
+    const chunk = decoder.decode(value, { stream: true });
+    if (debug) {
+      process.stderr.write(
+        `[codex-sse][chunk #${chunkIndex++}] bytes=${value.length} text=${JSON.stringify(chunk)}\n`
+      );
+    }
+    buffer += chunk;
     while (true) {
-      const splitIndex = buffer.indexOf("\n\n");
-      if (splitIndex === -1) {
+      const sep = findBlockSeparator(buffer);
+      if (!sep) {
         break;
       }
 
-      const block = buffer.slice(0, splitIndex);
-      buffer = buffer.slice(splitIndex + 2);
+      const block = buffer.slice(0, sep.index);
+      buffer = buffer.slice(sep.index + sep.length);
+      if (debug) {
+        process.stderr.write(`[codex-sse][block] ${JSON.stringify(block)}\n`);
+      }
       await handleEventBlock(block);
     }
   }
 
   buffer += decoder.decode();
   if (buffer.trim()) {
+    if (debug) {
+      process.stderr.write(`[codex-sse][tail] ${JSON.stringify(buffer)}\n`);
+    }
     await handleEventBlock(buffer);
+  }
+
+  if (debug) {
+    process.stderr.write(
+      `[codex-sse][end] deltaText.length=${deltaText.length} fallbackText.length=${fallbackText.length}\n`
+    );
   }
 
   return deltaText.trim() || fallbackText.trim();
@@ -595,10 +645,26 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
     prompt_cache_key: codexSessionId
   };
 
+  if (process.env.CODEX_SSE_DEBUG === "1") {
+    process.stderr.write(
+      `[codex-sse][request] body=${JSON.stringify(body)}\n`
+    );
+  }
+
   let res = await requestCodexResponse(body, auth);
   if ((res.status === 401 || res.status === 403) && auth.refreshToken) {
     await refreshCodexAccessToken();
     res = await requestCodexResponse(body, auth);
+  }
+
+  if (process.env.CODEX_SSE_DEBUG === "1") {
+    const headerDump = {};
+    for (const [k, v] of res.headers?.entries?.() || []) {
+      headerDump[k] = v;
+    }
+    process.stderr.write(
+      `[codex-sse][response] status=${res.status} headers=${JSON.stringify(headerDump)}\n`
+    );
   }
 
   if (res.status === 429) {
