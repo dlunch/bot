@@ -112,13 +112,13 @@ const HELLO_B64 = HELLO_BUFFER.toString("base64");
 // callCodex: body.tools shape tests (A, B, C)
 // ---------------------------------------------------------------------------
 
-test("(A) callCodex imageGeneration=false omits tools entirely (byte-level)", async () => {
+test("(A) callCodex default body matches codex-rs shape (tools:[], tool_choice, include, cache key)", async () => {
   const authStub = installCodexAuth();
-  let capturedBody;
+  let capturedInit;
   const fetchMock = installFetchMock(
     makeCodexFetchHandler(async (url, init) => {
       if (url.includes("codex/responses")) {
-        capturedBody = init.body;
+        capturedInit = init;
       }
       return sseEvent({ type: "response.output_text.delta", delta: "hi" });
     })
@@ -135,18 +135,20 @@ test("(A) callCodex imageGeneration=false omits tools entirely (byte-level)", as
     );
     assert.equal(result, "hi");
 
-    const parsed = JSON.parse(capturedBody);
-    assert.equal("tools" in parsed, false, "body.tools key must not exist");
+    const parsed = JSON.parse(capturedInit.body);
+    assert.deepEqual(parsed.tools, [], "tools must be present as empty array");
+    assert.equal(parsed.tool_choice, "auto");
+    assert.equal(parsed.parallel_tool_calls, false);
+    assert.deepEqual(parsed.include, []);
+    assert.equal(typeof parsed.prompt_cache_key, "string");
+    assert.equal(parsed.store, false);
+    assert.equal(parsed.stream, true);
 
-    // Byte-level comparison against an expected canonical body.
-    const expected = JSON.stringify({
-      model: "gpt-5",
-      instructions: "sys",
-      input: [{ role: "user", content: "hello" }],
-      store: false,
-      stream: true
-    });
-    assert.equal(capturedBody, expected, "body bytes must match the baseline exactly");
+    // Required streaming + auth headers to keep the SSE connection alive.
+    assert.equal(capturedInit.headers.Accept, "text/event-stream");
+    assert.equal(capturedInit.headers.originator, "codex_cli_rs");
+    assert.equal(typeof capturedInit.headers.session_id, "string");
+    assert.equal(typeof capturedInit.headers["x-client-request-id"], "string");
   } finally {
     fetchMock.restore();
     authStub.restore();

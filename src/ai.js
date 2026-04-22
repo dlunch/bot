@@ -1,10 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 const codexEndpoint = "https://chatgpt.com/backend-api/codex/responses";
 const refreshEndpoint = "https://auth.openai.com/oauth/token";
 const refreshClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
 const refreshExpirySkewMs = 30_000;
+const codexOriginator = "codex_cli_rs";
+const codexSessionId = randomUUID();
 
 const anthropicEndpoint = "https://api.anthropic.com/v1/messages";
 const anthropicVersion = "2023-06-01";
@@ -229,11 +232,14 @@ async function requestCodexResponse(body, auth) {
     throw new Error("access token is unavailable; token refresh may have failed");
   }
 
+  const requestId = randomUUID();
   const headers = {
     "Content-Type": "application/json",
+    Accept: "text/event-stream",
     Authorization: `Bearer ${auth.accessToken}`,
-    Origin: "https://chatgpt.com",
-    Referer: "https://chatgpt.com/"
+    originator: codexOriginator,
+    session_id: codexSessionId,
+    "x-client-request-id": requestId
   };
   if (auth.accountId) {
     headers["ChatGPT-Account-Id"] = auth.accountId;
@@ -566,26 +572,28 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
     await refreshCodexAccessToken();
   }
 
+  const imageGeneration = options?.imageGeneration === true;
+
+  const tools = [];
+  if (webSearch) {
+    tools.push({ type: "web_search" });
+  }
+  if (imageGeneration) {
+    tools.push({ type: "image_generation", output_format: "png" });
+  }
+
   const body = {
     model,
     instructions: systemPrompt,
     input: toResponsesInput(context),
+    tools,
+    tool_choice: "auto",
+    parallel_tool_calls: false,
     store: false,
-    stream: true
+    stream: true,
+    include: [],
+    prompt_cache_key: codexSessionId
   };
-
-  const imageGeneration = options?.imageGeneration === true;
-
-  if (webSearch || imageGeneration) {
-    const tools = [];
-    if (webSearch) {
-      tools.push({ type: "web_search" });
-    }
-    if (imageGeneration) {
-      tools.push({ type: "image_generation", output_format: "png" });
-    }
-    body.tools = tools;
-  }
 
   let res = await requestCodexResponse(body, auth);
   if ((res.status === 401 || res.status === 403) && auth.refreshToken) {
