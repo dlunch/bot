@@ -88,6 +88,19 @@ export async function startDiscordBot(config, options) {
   const maxImagesInContext = 3;
   const maxImageBytes = 5 * 1024 * 1024;
 
+  function hasImageAttachment(msg) {
+    const attachments = msg?.attachments;
+    if (!attachments || attachments.size === 0) {
+      return false;
+    }
+    for (const attachment of attachments.values()) {
+      if (typeof attachment?.contentType === "string" && attachment.contentType.startsWith("image/")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async function fetchDiscordImageAsDataUrl(attachment) {
     const contentType = attachment?.contentType;
     const url = attachment?.url;
@@ -125,7 +138,7 @@ export async function startDiscordBot(config, options) {
       }
 
       const text = cleanDiscordText(msg.content || "", botUserId);
-      if (!text) {
+      if (!text && !hasImageAttachment(msg)) {
         continue;
       }
 
@@ -174,13 +187,15 @@ export async function startDiscordBot(config, options) {
     }
 
     const enriched = [...context];
-    enriched[lastUserIdx] = {
-      role: "user",
-      content: [
-        { type: "input_text", text: context[lastUserIdx].content },
-        ...collected.map((url) => ({ type: "input_image", image_url: url }))
-      ]
-    };
+    const lastText = context[lastUserIdx].content;
+    const parts = [];
+    if (typeof lastText === "string" && lastText.trim()) {
+      parts.push({ type: "input_text", text: lastText });
+    }
+    for (const url of collected) {
+      parts.push({ type: "input_image", image_url: url });
+    }
+    enriched[lastUserIdx] = { role: "user", content: parts };
     return enriched;
   }
 

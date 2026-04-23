@@ -248,6 +248,12 @@ export async function startSlackBot(config, options) {
   const maxImagesInContext = 3;
   const maxImageBytes = 5 * 1024 * 1024;
 
+  function hasImageFile(message) {
+    return Array.isArray(message?.files) && message.files.some(
+      (file) => typeof file?.mimetype === "string" && file.mimetype.startsWith("image/")
+    );
+  }
+
   async function fetchSlackImageAsDataUrl(file) {
     const url = file?.url_private_download || file?.url_private;
     if (!url || typeof file?.mimetype !== "string" || !file.mimetype.startsWith("image/")) {
@@ -315,13 +321,15 @@ export async function startSlackBot(config, options) {
     }
 
     const enriched = [...context];
-    enriched[lastUserIdx] = {
-      role: "user",
-      content: [
-        { type: "input_text", text: context[lastUserIdx].content },
-        ...collected.map((url) => ({ type: "input_image", image_url: url }))
-      ]
-    };
+    const lastText = context[lastUserIdx].content;
+    const parts = [];
+    if (typeof lastText === "string" && lastText.trim()) {
+      parts.push({ type: "input_text", text: lastText });
+    }
+    for (const url of collected) {
+      parts.push({ type: "input_image", image_url: url });
+    }
+    enriched[lastUserIdx] = { role: "user", content: parts };
     return enriched;
   }
 
@@ -343,7 +351,7 @@ export async function startSlackBot(config, options) {
           }
 
           const text = cleanSlackText(message.text);
-          if (!text) {
+          if (!text && !hasImageFile(message)) {
             continue;
           }
 
@@ -378,7 +386,7 @@ export async function startSlackBot(config, options) {
 
     for (const message of messages) {
       const text = cleanSlackText(message.text);
-      if (!text) {
+      if (!text && !hasImageFile(message)) {
         continue;
       }
 
