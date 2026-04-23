@@ -374,13 +374,31 @@ export async function startSlackBot(config, options) {
     }
 
     const threadTs = event.thread_ts || event.ts;
-    const replies = await withSlackRetry(() => client.conversations.replies({
-      channel: event.channel,
-      ts: threadTs,
-      limit: maxThreadHistory
-    }), "conversations_replies");
+    // conversations.replies returns messages oldest-first and `limit` truncates
+    // from the BEGINNING of the thread, not the end. For long threads that
+    // means we'd capture the start of the conversation instead of the recent
+    // context near the mention. Paginate forward to the end and then keep the
+    // last maxThreadHistory messages.
+    const allReplies = [];
+    let cursor;
+    const pageSize = 200;
+    const hardCap = Math.max(maxThreadHistory * 5, pageSize * 5);
+    do {
+      const page = await withSlackRetry(() => client.conversations.replies({
+        channel: event.channel,
+        ts: threadTs,
+        limit: pageSize,
+        cursor
+      }), "conversations_replies");
+      const pageMessages = page.messages || [];
+      allReplies.push(...pageMessages);
+      cursor = page.has_more ? page.response_metadata?.next_cursor : undefined;
+    } while (cursor && allReplies.length < hardCap);
 
-    const messages = replies.messages || [];
+    const messages =
+      allReplies.length > maxThreadHistory
+        ? allReplies.slice(-maxThreadHistory)
+        : allReplies;
     const keptMessages = [];
     const context = [];
 
