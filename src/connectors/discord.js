@@ -252,7 +252,7 @@ export async function startDiscordBot(config, options) {
     let replyMessage = null;
     let pendingUpdate = null;
     let lastUpdateAt = 0;
-    let addedReaction = false;
+    let eyesReaction = null;
     let streamedText = "";
     let currentMsgOffset = 0;
     let syncInFlight = Promise.resolve();
@@ -265,8 +265,7 @@ export async function startDiscordBot(config, options) {
 
     try {
       try {
-        await message.react("👀");
-        addedReaction = true;
+        eyesReaction = await message.react("👀");
       } catch (error) {
         console.error("[discord][reaction_add] skipped", error);
       }
@@ -541,9 +540,9 @@ export async function startDiscordBot(config, options) {
         }
       }
 
-      if (addedReaction) {
+      if (eyesReaction) {
         try {
-          await message.reactions.resolve("👀")?.users.remove(client.user.id);
+          await eyesReaction.users.remove(client.user.id);
         } catch (error) {
           console.error("[discord][reaction_remove] skipped", error);
         }
