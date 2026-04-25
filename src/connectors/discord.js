@@ -126,9 +126,46 @@ export async function startDiscordBot(config, options) {
     }
   }
 
+  async function walkReplyChain(message, maxLength) {
+    // Walk backward from `message` following message.reference.messageId until
+    // we run out of refs, the parent fetch fails, or we hit maxLength. Returns
+    // chain in oldest-first order.
+    const chain = [message];
+    let current = message;
+    while (chain.length < maxLength) {
+      const refId = current?.reference?.messageId;
+      if (!refId) {
+        break;
+      }
+      try {
+        const parent = await current.channel.messages.fetch(refId);
+        chain.push(parent);
+        current = parent;
+      } catch (err) {
+        console.warn(`[discord][reply_chain] fetch failed id=${refId}`, err);
+        break;
+      }
+    }
+    return chain.reverse();
+  }
+
   async function buildContext(message, botUserId) {
-    const fetched = await message.channel.messages.fetch({ limit: maxThreadHistory });
-    const messages = [...fetched.values()].reverse();
+    // Discord text channels mix unrelated conversations, so for non-thread,
+    // non-DM channels we follow the reply chain instead of pulling the channel's
+    // recent messages. Threads and DMs are isolated to a single conversation,
+    // so the channel-wide fetch is fine there.
+    const useReplyChain =
+      typeof message.channel?.isThread === "function" &&
+      !message.channel.isThread() &&
+      message.channel.type !== 1; // ChannelType.DM === 1
+
+    let messages;
+    if (useReplyChain) {
+      messages = await walkReplyChain(message, maxThreadHistory);
+    } else {
+      const fetched = await message.channel.messages.fetch({ limit: maxThreadHistory });
+      messages = [...fetched.values()].reverse();
+    }
     const keptMessages = [];
     const context = [];
 
