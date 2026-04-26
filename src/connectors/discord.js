@@ -1,4 +1,4 @@
-import { AttachmentBuilder, Client, GatewayIntentBits, Partials } from "discord.js";
+import { AttachmentBuilder, Client, EmbedBuilder, GatewayIntentBits, Partials } from "discord.js";
 import { createAiResponse } from "../ai.js";
 
 /**
@@ -36,27 +36,53 @@ export async function deliverDiscordImages(message, { images } = {}) {
     return;
   }
 
+  // Discord limits: message.content max 2000 chars, embed.description max 4096.
+  // Codex's revised_prompt often overflows 2000, so when it does we fall back
+  // to an embed (4x more space). Beyond 4096 we hard-truncate the embed text.
+  const discordContentMax = 2000;
+  const discordEmbedDescriptionMax = 4096;
+  const truncate = (text, max) => {
+    if (text.length <= max) return text;
+    return text.slice(0, max - 1) + "…";
+  };
+
   for (const image of images) {
-    const content =
+    const rawPrompt =
       typeof image?.revisedPrompt === "string" ? image.revisedPrompt.trim() : "";
     const filename = `image-${sanitizeFilenameId(image?.id)}.png`;
     try {
       const attachment = new AttachmentBuilder(image.buffer, { name: filename });
-      await channel.send({
-        content,
-        files: [attachment],
-        allowedMentions: { parse: [] },
-        reply: message?.id
-          ? { messageReference: message.id, failIfNotExists: false }
-          : undefined
-      });
+      const replyRef = message?.id
+        ? { messageReference: message.id, failIfNotExists: false }
+        : undefined;
+
+      let payload;
+      if (rawPrompt.length <= discordContentMax) {
+        payload = {
+          content: rawPrompt,
+          files: [attachment],
+          allowedMentions: { parse: [] },
+          reply: replyRef
+        };
+      } else {
+        const embed = new EmbedBuilder()
+          .setDescription(truncate(rawPrompt, discordEmbedDescriptionMax))
+          .setImage(`attachment://${filename}`);
+        payload = {
+          embeds: [embed],
+          files: [attachment],
+          allowedMentions: { parse: [] },
+          reply: replyRef
+        };
+      }
+      await channel.send(payload);
       console.log(`[discord][image_deliver] id=${image?.id}`);
     } catch (err) {
       console.error(`[discord][image_upload] failed id=${image?.id}`, err);
       const reason = err?.message || "unknown";
       try {
         await channel.send({
-          content: `⚠️ 이미지 업로드 실패 (id=${image?.id}): ${reason}`,
+          content: truncate(`⚠️ 이미지 업로드 실패 (id=${image?.id}): ${reason}`, discordContentMax),
           allowedMentions: { parse: [] }
         });
       } catch (notifyErr) {
