@@ -590,6 +590,31 @@ async function parseAnthropicSseStream(stream, onDelta) {
   return deltaText.trim();
 }
 
+function isTransientNetworkError(error) {
+  // undici (Node's built-in fetch) classifies abrupt socket closures and
+  // common network blips with these codes. We retry on these because they
+  // typically reflect edge/Cloudflare hiccups rather than client bugs.
+  const transientCodes = new Set([
+    "UND_ERR_SOCKET",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "EAI_AGAIN",
+    "ENETUNREACH",
+    "ENOTFOUND"
+  ]);
+  if (transientCodes.has(error?.code)) return true;
+  if (transientCodes.has(error?.cause?.code)) return true;
+  const msg = String(error?.cause?.message || error?.message || "");
+  return /terminated|fetch failed|other side closed|socket hang up/i.test(msg);
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 class RateLimitError extends Error {
   constructor(provider, model, detail) {
     super(`[${provider}] rate limited on model=${model}: ${detail}`);
@@ -807,6 +832,10 @@ export async function createAiResponse(context, options = {}) {
   };
 
   let lastError;
+  const transientRetryCount = Number.isFinite(Number(options.transientRetryCount))
+    ? Math.max(0, Number(options.transientRetryCount))
+    : 2;
+
   for (const model of models) {
     const provider = resolveProvider(model, providers);
     let movedToNextModel = false;
@@ -817,6 +846,7 @@ export async function createAiResponse(context, options = {}) {
       );
     }
 
+    let transientRetries = 0;
     for (let attempt = 0; attempt <= emptyRetryCount; attempt++) {
       imageCount = 0;
       imageActivity = false;
@@ -848,6 +878,16 @@ export async function createAiResponse(context, options = {}) {
           console.warn(`[ai] ${error.message}, falling back to next model`);
           movedToNextModel = true;
           break;
+        }
+        if (isTransientNetworkError(error) && transientRetries < transientRetryCount) {
+          transientRetries++;
+          const backoffMs = 500 * transientRetries;
+          console.warn(
+            `[ai] transient network error (${error?.code || error?.cause?.code || error?.name}), retrying ${transientRetries}/${transientRetryCount} after ${backoffMs}ms`
+          );
+          await sleepMs(backoffMs);
+          attempt--; // re-do this attempt after the delay
+          continue;
         }
         throw error;
       }
