@@ -200,7 +200,17 @@ export async function startDiscordBot(config, options) {
         continue;
       }
 
-      const text = cleanDiscordText(msg.content || "", botUserId);
+      const baseText = cleanDiscordText(msg.content || "", botUserId);
+      // Pull text out of any embeds (title + description). The bot itself
+      // sometimes posts long revised_prompts as embed.description when they
+      // exceed the 2000-char content limit, so without this the next turn's
+      // context would lose what was generated last time.
+      const embedTexts = [];
+      for (const embed of msg.embeds || []) {
+        if (embed?.title) embedTexts.push(embed.title);
+        if (embed?.description) embedTexts.push(embed.description);
+      }
+      const text = [baseText, ...embedTexts].filter(Boolean).join("\n").trim();
       if (!text && !hasImageAttachment(msg)) {
         continue;
       }
