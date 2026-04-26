@@ -10,8 +10,8 @@
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {
-    "@slack/bolt": "^4.6.0",
-    "discord.js": "^14.15.3",
+    "@slack/bolt": "^4.7.1",
+    "discord.js": "^14.26.3",
     "dotenv": "^16.4.5"
   }
 }
