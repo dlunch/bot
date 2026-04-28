@@ -214,28 +214,39 @@ export async function startDiscordBot(config, options) {
     }
     chain.reverse();
 
+    // Reserve the backward chain in full and only spend the leftover budget on
+    // forward chunks. Otherwise older bot continuations could push out the
+    // newest user turn (the triggering request), which always sits at the tail
+    // of `chain`.
+    let forwardBudget = Math.max(0, maxLength - chain.length);
+    const seen = new Set(chain.map((m) => m.id));
     const result = [];
-    const seen = new Set();
-    for (const msg of chain) {
-      if (seen.has(msg.id)) {
-        continue;
-      }
-      seen.add(msg.id);
+    for (let i = 0; i < chain.length; i++) {
+      const msg = chain[i];
       result.push(msg);
-      if (result.length >= maxLength) {
-        break;
-      }
-      if (msg.author?.id !== botUserId) {
+      if (forwardBudget <= 0 || msg.author?.id !== botUserId) {
         continue;
       }
-      const forwardChunks = await walkBotChunkForward(msg, botUserId, maxLength - result.length);
+      // If the next chain message is already a continuation of this bot
+      // message, its successors will be picked up from there — no need to
+      // refetch and risk extra rate-limit pressure.
+      const next = chain[i + 1];
+      if (
+        next &&
+        next.author?.id === botUserId &&
+        next?.reference?.messageId === msg.id
+      ) {
+        continue;
+      }
+      const forwardChunks = await walkBotChunkForward(msg, botUserId, forwardBudget);
       for (const fwd of forwardChunks) {
         if (seen.has(fwd.id)) {
           continue;
         }
         seen.add(fwd.id);
         result.push(fwd);
-        if (result.length >= maxLength) {
+        forwardBudget--;
+        if (forwardBudget <= 0) {
           break;
         }
       }
@@ -452,11 +463,17 @@ export async function startDiscordBot(config, options) {
 
       const sendChunk = (text) => {
         if (currentMsgOffset === 0) {
-          return message.reply(text);
+          return message.reply({
+            content: text,
+            allowedMentions: { parse: [] }
+          });
         }
         const ref = lastChunkMessage;
         if (!ref?.id) {
-          return message.channel.send(text);
+          return message.channel.send({
+            content: text,
+            allowedMentions: { parse: [] }
+          });
         }
         // Chain subsequent chunks to the previous chunk so walkReplyChain can
         // recover the full answer when the user replies to any single chunk.
