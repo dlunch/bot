@@ -243,6 +243,13 @@ export async function startDiscordBot(config, options) {
         if (seen.has(fwd.id)) {
           continue;
         }
+        // Only include chunks that occurred before the next message in the
+        // backward chain to preserve chronological ordering. Forward chunks
+        // are already sorted ascending by timestamp (walkBotChunkForward),
+        // so we can break early once we pass the cutoff.
+        if (next && (fwd.createdTimestamp || 0) >= (next.createdTimestamp || 0)) {
+          break;
+        }
         seen.add(fwd.id);
         result.push(fwd);
         forwardBudget--;
