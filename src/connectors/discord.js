@@ -152,10 +152,50 @@ export async function startDiscordBot(config, options) {
     }
   }
 
-  async function walkReplyChain(message, maxLength) {
+  async function walkBotChunkForward(seedMessage, botUserId, maxLength) {
+    // A long bot answer is split into multiple Discord messages (2000-char
+    // cap). Each subsequent chunk replies to its predecessor, so given a bot
+    // message we can walk forward in the channel to recover the rest.
+    if (maxLength <= 0) {
+      return [];
+    }
+    let fetched;
+    try {
+      fetched = await seedMessage.channel.messages.fetch({
+        after: seedMessage.id,
+        limit: Math.min(50, Math.max(maxLength * 2, 10))
+      });
+    } catch (err) {
+      console.warn(`[discord][reply_chain] forward fetch failed id=${seedMessage.id}`, err);
+      return [];
+    }
+    const sorted = [...fetched.values()].sort(
+      (a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0)
+    );
+    const result = [];
+    let lastId = seedMessage.id;
+    for (const msg of sorted) {
+      if (result.length >= maxLength) {
+        break;
+      }
+      if (msg.author?.id !== botUserId) {
+        continue;
+      }
+      if (msg?.reference?.messageId !== lastId) {
+        continue;
+      }
+      result.push(msg);
+      lastId = msg.id;
+    }
+    return result;
+  }
+
+  async function walkReplyChain(message, maxLength, botUserId) {
     // Walk backward from `message` following message.reference.messageId until
     // we run out of refs, the parent fetch fails, or we hit maxLength. Returns
-    // chain in oldest-first order.
+    // chain in oldest-first order. For each bot message in the chain, also
+    // pull in any forward chunks (long-answer continuations) so replying to
+    // any single chunk still surfaces the rest.
     const chain = [message];
     let current = message;
     while (chain.length < maxLength) {
@@ -172,7 +212,53 @@ export async function startDiscordBot(config, options) {
         break;
       }
     }
-    return chain.reverse();
+    chain.reverse();
+
+    // Reserve the backward chain in full and only spend the leftover budget on
+    // forward chunks. Otherwise older bot continuations could push out the
+    // newest user turn (the triggering request), which always sits at the tail
+    // of `chain`.
+    let forwardBudget = Math.max(0, maxLength - chain.length);
+    const seen = new Set(chain.map((m) => m.id));
+    const result = [];
+    for (let i = 0; i < chain.length; i++) {
+      const msg = chain[i];
+      result.push(msg);
+      if (forwardBudget <= 0 || msg.author?.id !== botUserId) {
+        continue;
+      }
+      // If the next chain message is already a continuation of this bot
+      // message, its successors will be picked up from there — no need to
+      // refetch and risk extra rate-limit pressure.
+      const next = chain[i + 1];
+      if (
+        next &&
+        next.author?.id === botUserId &&
+        next?.reference?.messageId === msg.id
+      ) {
+        continue;
+      }
+      const forwardChunks = await walkBotChunkForward(msg, botUserId, forwardBudget);
+      for (const fwd of forwardChunks) {
+        if (seen.has(fwd.id)) {
+          continue;
+        }
+        // Only include chunks that occurred before the next message in the
+        // backward chain to preserve chronological ordering. Forward chunks
+        // are already sorted ascending by timestamp (walkBotChunkForward),
+        // so we can break early once we pass the cutoff.
+        if (next && (fwd.createdTimestamp || 0) >= (next.createdTimestamp || 0)) {
+          break;
+        }
+        seen.add(fwd.id);
+        result.push(fwd);
+        forwardBudget--;
+        if (forwardBudget <= 0) {
+          break;
+        }
+      }
+    }
+    return result;
   }
 
   async function buildContext(message, botUserId) {
@@ -187,7 +273,7 @@ export async function startDiscordBot(config, options) {
 
     let messages;
     if (useReplyChain) {
-      messages = await walkReplyChain(message, maxThreadHistory);
+      messages = await walkReplyChain(message, maxThreadHistory, botUserId);
     } else {
       const fetched = await message.channel.messages.fetch({ limit: maxThreadHistory });
       messages = [...fetched.values()].reverse();
@@ -323,6 +409,7 @@ export async function startDiscordBot(config, options) {
     }
 
     let replyMessage = null;
+    let lastChunkMessage = null;
     let pendingUpdate = null;
     let lastUpdateAt = 0;
     let eyesReaction = null;
@@ -381,11 +468,33 @@ export async function startDiscordBot(config, options) {
         }
       };
 
+      const sendChunk = (text) => {
+        if (currentMsgOffset === 0) {
+          return message.reply({
+            content: text,
+            allowedMentions: { parse: [] }
+          });
+        }
+        const ref = lastChunkMessage;
+        if (!ref?.id) {
+          return message.channel.send({
+            content: text,
+            allowedMentions: { parse: [] }
+          });
+        }
+        // Chain subsequent chunks to the previous chunk so walkReplyChain can
+        // recover the full answer when the user replies to any single chunk.
+        return message.channel.send({
+          content: text,
+          allowedMentions: { parse: [], repliedUser: false },
+          reply: { messageReference: ref.id, failIfNotExists: false }
+        });
+      };
+
       const postMessage = async (text) => {
         const content = capDiscordText(text);
-        const send = currentMsgOffset === 0 ? () => message.reply(content) : () => message.channel.send(content);
         try {
-          const reply = await send();
+          const reply = await sendChunk(content);
           return { reply, consumedLength: content === "." ? 0 : content.length };
         } catch (error) {
           if (!isDiscordTooLong(error) || content.length <= 1) {
@@ -394,9 +503,7 @@ export async function startDiscordBot(config, options) {
 
           const consumedLength = Math.floor(content.length / 2);
           const fallbackContent = content.slice(0, consumedLength) || ".";
-          const reply = currentMsgOffset === 0
-            ? await message.reply(fallbackContent)
-            : await message.channel.send(fallbackContent);
+          const reply = await sendChunk(fallbackContent);
           return { reply, consumedLength };
         }
       };
@@ -414,6 +521,7 @@ export async function startDiscordBot(config, options) {
           } else {
             const result = await postMessage(currentText);
             replyMessage = result.reply;
+            lastChunkMessage = result.reply;
             lastUpdateAt = Date.now();
             consumedLength = result.consumedLength;
           }
