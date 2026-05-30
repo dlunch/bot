@@ -339,6 +339,19 @@ export async function startDiscordBot(config, options) {
     } else {
       const fetched = await message.channel.messages.fetch({ limit: maxThreadHistory });
       messages = [...fetched.values()].reverse();
+      // A thread started from a message keeps that message as its STARTER, which
+      // lives in the parent channel and is absent from the thread fetch above.
+      // Prepend it so the topic that framed the thread stays in context.
+      if (typeof message.channel?.isThread === "function" && message.channel.isThread()) {
+        try {
+          const starter = await message.channel.fetchStarterMessage?.();
+          if (starter && !messages.some((m) => m.id === starter.id)) {
+            messages.unshift(starter);
+          }
+        } catch {
+          // No starter (deleted, or standalone/forum thread) — nothing to add.
+        }
+      }
     }
     const keptMessages = [];
     const context = [];
@@ -459,11 +472,24 @@ export async function startDiscordBot(config, options) {
     return error?.code === 50035 || String(error?.message || "").includes("2000 or fewer");
   }
 
-  async function botHasMessagedInThread(channel, botUserId) {
+  async function botParticipatesInThread(channel, botUserId) {
+    // A thread spun off the bot's own message keeps that message as the thread
+    // STARTER, which lives in the parent channel and never shows up in the
+    // in-thread fetch below. Check it first so those threads aren't missed.
+    try {
+      const starter = await channel.fetchStarterMessage?.();
+      if (starter?.author?.id === botUserId) {
+        return true;
+      }
+    } catch {
+      // No starter (e.g. forum/standalone thread) — fall through to the fetch.
+    }
     try {
       const fetched = await channel.messages.fetch({ limit: maxThreadHistory });
       for (const msg of fetched.values()) {
-        if (msg.author?.id === botUserId) {
+        // Bot already spoke here, or a user pulled it in via mention earlier in
+        // the thread — either way it's an active participant.
+        if (msg.author?.id === botUserId || msg.mentions?.has?.(botUserId)) {
           return true;
         }
       }
@@ -492,7 +518,7 @@ export async function startDiscordBot(config, options) {
     // directed at the bot so follow-ups don't each need an explicit mention.
     let shouldRespond = isDm || mentioned;
     if (!shouldRespond && inThread) {
-      shouldRespond = await botHasMessagedInThread(message.channel, client.user.id);
+      shouldRespond = await botParticipatesInThread(message.channel, client.user.id);
     }
     if (!shouldRespond) {
       return;
@@ -559,6 +585,14 @@ export async function startDiscordBot(config, options) {
       };
 
       const sendChunk = (text) => {
+        // In a thread the whole conversation is fetched as context, so reply
+        // references (and chunk-to-chunk chaining) add only visual noise.
+        if (inThread) {
+          return message.channel.send({
+            content: text,
+            allowedMentions: { parse: [] }
+          });
+        }
         if (currentMsgOffset === 0) {
           return message.reply({
             content: text,
