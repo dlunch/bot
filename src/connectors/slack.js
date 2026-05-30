@@ -1,5 +1,6 @@
 import SlackBolt from "@slack/bolt";
 import { createAiResponse } from "../ai.js";
+import { isTextLike, fetchTextAttachmentBlock, maxTextFilesInContext } from "./attachments.js";
 
 const { App, SocketModeReceiver } = SlackBolt;
 
@@ -254,6 +255,55 @@ export async function startSlackBot(config, options) {
     );
   }
 
+  function isSlackTextFile(file) {
+    if (typeof file?.mimetype === "string" && file.mimetype.startsWith("image/")) {
+      return false;
+    }
+    return isTextLike(file?.name, file?.mimetype);
+  }
+
+  function hasTextFile(message) {
+    return Array.isArray(message?.files) && message.files.some(isSlackTextFile);
+  }
+
+  async function enrichContextWithTextFiles(context, messages) {
+    // Text attachments carry no role restriction (unlike images), so inline
+    // them into the message they belong to. Walk newest-first so the budget
+    // favors the most recent files when a thread has many.
+    let budget = maxTextFilesInContext;
+    for (let i = messages.length - 1; i >= 0 && budget > 0; i--) {
+      const files = messages[i]?.files;
+      if (!Array.isArray(files) || !files.length) {
+        continue;
+      }
+      const blocks = [];
+      for (const file of files) {
+        if (budget <= 0) {
+          break;
+        }
+        if (!isSlackTextFile(file)) {
+          continue;
+        }
+        const block = await fetchTextAttachmentBlock({
+          url: file?.url_private_download || file?.url_private,
+          name: file?.name,
+          headers: { Authorization: `Bearer ${config.botToken}` }
+        });
+        if (block) {
+          blocks.push(block);
+          budget--;
+        }
+      }
+      if (blocks.length) {
+        const existing = typeof context[i].content === "string" ? context[i].content : "";
+        context[i] = {
+          ...context[i],
+          content: [existing, ...blocks].filter(Boolean).join("\n\n")
+        };
+      }
+    }
+  }
+
   async function fetchSlackImageAsDataUrl(file) {
     const url = file?.url_private_download || file?.url_private;
     if (!url || typeof file?.mimetype !== "string" || !file.mimetype.startsWith("image/")) {
@@ -351,7 +401,7 @@ export async function startSlackBot(config, options) {
           }
 
           const text = cleanSlackText(message.text);
-          if (!text && !hasImageFile(message)) {
+          if (!text && !hasImageFile(message) && !hasTextFile(message)) {
             continue;
           }
 
@@ -365,6 +415,7 @@ export async function startSlackBot(config, options) {
           });
         }
 
+        await enrichContextWithTextFiles(context, keptMessages);
         return await enrichContextWithImages(context, keptMessages);
       } catch (error) {
         console.error("[slack][dm_context] history load failed, fallback to current message", error);
@@ -404,7 +455,7 @@ export async function startSlackBot(config, options) {
 
     for (const message of messages) {
       const text = cleanSlackText(message.text);
-      if (!text && !hasImageFile(message)) {
+      if (!text && !hasImageFile(message) && !hasTextFile(message)) {
         continue;
       }
 
@@ -418,6 +469,7 @@ export async function startSlackBot(config, options) {
       });
     }
 
+    await enrichContextWithTextFiles(context, keptMessages);
     return await enrichContextWithImages(context, keptMessages);
   }
 

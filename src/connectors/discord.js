@@ -1,5 +1,6 @@
 import { AttachmentBuilder, Client, EmbedBuilder, GatewayIntentBits, Partials } from "discord.js";
 import { createAiResponse } from "../ai.js";
+import { isTextLike, fetchTextAttachmentBlock, maxTextFilesInContext } from "./attachments.js";
 
 /**
  * Sanitize a Codex item id so it is safe to use as a filename component.
@@ -125,6 +126,67 @@ export async function startDiscordBot(config, options) {
       }
     }
     return false;
+  }
+
+  function hasTextAttachment(msg) {
+    const attachments = msg?.attachments;
+    if (!attachments || attachments.size === 0) {
+      return false;
+    }
+    for (const attachment of attachments.values()) {
+      if (
+        typeof attachment?.contentType !== "string" ||
+        !attachment.contentType.startsWith("image/")
+      ) {
+        if (isTextLike(attachment?.name, attachment?.contentType)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  async function enrichContextWithTextFiles(context, keptMessages) {
+    // Text attachments carry no role restriction (unlike images), so inline
+    // them into the message they belong to. Walk newest-first so the budget
+    // favors the most recent files when a thread has many.
+    let budget = maxTextFilesInContext;
+    for (let i = keptMessages.length - 1; i >= 0 && budget > 0; i--) {
+      const attachments = keptMessages[i]?.attachments;
+      if (!attachments || attachments.size === 0) {
+        continue;
+      }
+      const blocks = [];
+      for (const attachment of attachments.values()) {
+        if (budget <= 0) {
+          break;
+        }
+        if (
+          typeof attachment?.contentType === "string" &&
+          attachment.contentType.startsWith("image/")
+        ) {
+          continue;
+        }
+        if (!isTextLike(attachment?.name, attachment?.contentType)) {
+          continue;
+        }
+        const block = await fetchTextAttachmentBlock({
+          url: attachment?.url,
+          name: attachment?.name
+        });
+        if (block) {
+          blocks.push(block);
+          budget--;
+        }
+      }
+      if (blocks.length) {
+        const existing = typeof context[i].content === "string" ? context[i].content : "";
+        context[i] = {
+          ...context[i],
+          content: [existing, ...blocks].filter(Boolean).join("\n\n")
+        };
+      }
+    }
   }
 
   async function fetchDiscordImageAsDataUrl(attachment) {
@@ -297,7 +359,7 @@ export async function startDiscordBot(config, options) {
         if (embed?.description) embedTexts.push(embed.description);
       }
       const text = [baseText, ...embedTexts].filter(Boolean).join("\n").trim();
-      if (!text && !hasImageAttachment(msg)) {
+      if (!text && !hasImageAttachment(msg) && !hasTextAttachment(msg)) {
         continue;
       }
 
@@ -307,6 +369,11 @@ export async function startDiscordBot(config, options) {
         content: text
       });
     }
+
+    // Inline text-file attachments before image enrichment, which rewrites the
+    // last user turn's content into a parts array (where the string-append below
+    // would no longer apply).
+    await enrichContextWithTextFiles(context, keptMessages);
 
     // Collect the most-recent N images from thread history and attach them ALL
     // to the last user turn (which is the current request). See slack.js for
@@ -392,6 +459,21 @@ export async function startDiscordBot(config, options) {
     return error?.code === 50035 || String(error?.message || "").includes("2000 or fewer");
   }
 
+  async function botHasMessagedInThread(channel, botUserId) {
+    try {
+      const fetched = await channel.messages.fetch({ limit: maxThreadHistory });
+      for (const msg of fetched.values()) {
+        if (msg.author?.id === botUserId) {
+          return true;
+        }
+      }
+      return false;
+    } catch (error) {
+      console.warn("[discord][thread_participation] fetch failed", error);
+      return false;
+    }
+  }
+
   client.on("messageCreate", async (message) => {
     if (!client.user) {
       return;
@@ -403,8 +485,16 @@ export async function startDiscordBot(config, options) {
 
     const isDm = message.channel.type === 1;
     const mentioned = message.mentions.has(client.user);
+    const inThread =
+      typeof message.channel?.isThread === "function" && message.channel.isThread();
 
-    if (!isDm && !mentioned) {
+    // In a thread the bot already participates in, treat every message as
+    // directed at the bot so follow-ups don't each need an explicit mention.
+    let shouldRespond = isDm || mentioned;
+    if (!shouldRespond && inThread) {
+      shouldRespond = await botHasMessagedInThread(message.channel, client.user.id);
+    }
+    if (!shouldRespond) {
       return;
     }
 
