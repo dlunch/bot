@@ -1,5 +1,12 @@
 replicaCount: 1
 
+# The bot is a singleton: if a new pod overlaps the old one during a rollout,
+# both connect to Slack/Discord and replies go out twice. Recreate tears down
+# the old pod first. (The auth PVC is ReadWriteOnce, so RollingUpdate would also
+# leave the new pod unable to mount the volume.)
+strategy:
+  type: Recreate
+
 image:
   repository: ghcr.io/dlunch/bot
   pullPolicy: Always
