@@ -520,6 +520,17 @@ export async function startDiscordBot(config, options) {
     if (!shouldRespond && inThread) {
       shouldRespond = await botParticipatesInThread(message.channel, client.user.id);
     }
+    // A reply to one of the bot's own messages is a conversation continuation.
+    // Discord only adds the replied-to user to mentions when the reply ping is
+    // on, so an explicit author check catches the ping-off case too.
+    if (!shouldRespond && message.reference?.messageId) {
+      try {
+        const referenced = await message.fetchReference();
+        shouldRespond = referenced?.author?.id === client.user.id;
+      } catch (error) {
+        console.warn("[discord][reply_ref] fetch failed", error);
+      }
+    }
     if (!shouldRespond) {
       return;
     }
