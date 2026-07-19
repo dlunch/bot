@@ -47,10 +47,15 @@ const maxToolRounds = 5;
 const maxAttachFilenameLength = 80;
 
 const attachFileGuidance =
-  "When your reply would include long code or long text (roughly more than 30 lines or " +
-  "1500 characters), call the attach_file tool with a suitable filename and the COMPLETE " +
-  "content, and keep only a brief explanation in the message body. Never repeat attached " +
-  "file content in the body. For short snippets, answer inline with normal code blocks.";
+  "Answer inline in the message body by default; length alone is never a reason to attach a file. " +
+  "Use attach_file only when the user explicitly asks for a file or download, or when the content " +
+  "is a complete standalone deliverable (such as a runnable full program or a long document or " +
+  "dataset) for which a file is clearly more useful and inline output would seriously harm " +
+  "readability. Do not use attach_file for explanations, analysis, ordinary answers, medium-length " +
+  "code, or multiple small snippets. When uncertain, answer inline. When attaching, use a suitable " +
+  "filename and the COMPLETE content. Before calling attach_file, first write and stream a brief " +
+  "explanation in the message body so the user gets an immediate response. Never repeat attached " +
+  "file content in the body.";
 
 // Extensions that render (with scripts) on open in a browser or auto-execute /
 // follow links on double-click on Windows. Regular scripts (.sh/.py/.bat/...)
@@ -460,7 +465,7 @@ function parseSseResponse(raw) {
   return deltaText.trim() || fallbackText.trim();
 }
 
-async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemCollector) {
+async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemCollector, onFileEvent) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -468,6 +473,7 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemC
   let fallbackText = "";
   const debug = process.env.CODEX_SSE_DEBUG === "1";
   let chunkIndex = 0;
+  const announcedFileCalls = new Set();
 
   const handleEventBlock = async (block) => {
     const lines = block.split("\n");
@@ -511,6 +517,24 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemC
         await onDelta(event.delta, deltaText);
       }
       return;
+    }
+
+    if (
+      (event?.type === "response.output_item.added" || event?.type === "response.output_item.done") &&
+      event.item?.type === "function_call" &&
+      event.item?.name === attachFileToolName
+    ) {
+      const callId = event.item.call_id || event.item.id;
+      if (!announcedFileCalls.has(callId)) {
+        announcedFileCalls.add(callId);
+        if (typeof onFileEvent === "function") {
+          try {
+            await onFileEvent({ type: event.type, itemId: event.item.id, callId });
+          } catch (cbErr) {
+            console.error(`[ai][file] onFileEvent callback threw type=${event.type}`, cbErr);
+          }
+        }
+      }
     }
 
     // function_call arguments stream as deltas too, but the complete JSON string
@@ -678,7 +702,7 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemC
   return deltaText.trim() || fallbackText.trim();
 }
 
-async function parseAnthropicSseStream(stream, onDelta, blockCollector) {
+async function parseAnthropicSseStream(stream, onDelta, blockCollector, onFileEvent) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -691,6 +715,17 @@ async function parseAnthropicSseStream(stream, onDelta, blockCollector) {
       event.content_block?.type === "tool_use" &&
       Number.isInteger(event.index)
     ) {
+      if (event.content_block.name === attachFileToolName && typeof onFileEvent === "function") {
+        try {
+          await onFileEvent({
+            type: event.type,
+            itemId: event.content_block.id,
+            callId: event.content_block.id
+          });
+        } catch (cbErr) {
+          console.error(`[ai][file] onFileEvent callback threw type=${event.type}`, cbErr);
+        }
+      }
       blockCollector.blocks[event.index] = {
         type: "tool_use",
         id: event.content_block.id,
@@ -859,6 +894,8 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
   const onImageEvent =
     typeof options?.onImageEvent === "function" ? options.onImageEvent : undefined;
   const onFile = typeof options?.onFile === "function" ? options.onFile : undefined;
+  const onFileEvent =
+    typeof options?.onFileEvent === "function" ? options.onFileEvent : undefined;
 
   const tools = [];
   if (webSearch) {
@@ -945,7 +982,9 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
       }
 
       if (res.body) {
-        roundText = await parseCodexSseStream(res.body, loopOnDelta, onImage, onImageEvent, collector);
+        roundText = await parseCodexSseStream(
+          res.body, loopOnDelta, onImage, onImageEvent, collector, onFileEvent
+        );
       } else {
         // Non-streaming fallback: tool loop unsupported here, return text only.
         const raw = await res.text();
@@ -1011,6 +1050,8 @@ async function callAnthropic(model, context, systemPrompt, onDelta, options = {}
   }
 
   const onFile = typeof options?.onFile === "function" ? options.onFile : undefined;
+  const onFileEvent =
+    typeof options?.onFileEvent === "function" ? options.onFileEvent : undefined;
   const handleAttachFile = onFile ? createAttachFileHandler(onFile) : undefined;
 
   let messages = context.map((msg) => ({
@@ -1072,7 +1113,7 @@ async function callAnthropic(model, context, systemPrompt, onDelta, options = {}
       }
 
       if (res.body) {
-        roundText = await parseAnthropicSseStream(res.body, loopOnDelta, collector);
+        roundText = await parseAnthropicSseStream(res.body, loopOnDelta, collector, onFileEvent);
       } else {
         // Non-streaming fallback: tool loop unsupported here, return text only.
         const raw = await res.text();
@@ -1164,6 +1205,8 @@ export async function createAiResponse(context, options = {}) {
   const userOnImageEvent =
     typeof options.onImageEvent === "function" ? options.onImageEvent : undefined;
   const userOnFile = typeof options.onFile === "function" ? options.onFile : undefined;
+  const userOnFileEvent =
+    typeof options.onFileEvent === "function" ? options.onFileEvent : undefined;
 
   const models =
     Array.isArray(options.models) && options.models.length > 0
@@ -1193,6 +1236,7 @@ export async function createAiResponse(context, options = {}) {
   let imageCount = 0;
   let imageActivity = false;
   let fileCount = 0;
+  let fileActivity = false;
   const wrappedOnFile = userOnFile
     ? (file) => {
         fileCount++;
@@ -1224,6 +1268,20 @@ export async function createAiResponse(context, options = {}) {
       }
     }
   };
+  const onFileEvent = async (evt) => {
+    const firstEventInAttempt = !fileActivity;
+    fileActivity = true;
+    if (firstEventInAttempt) {
+      console.log(`[ai] file generation in progress... (${evt?.type})`);
+    }
+    if (userOnFileEvent) {
+      try {
+        await userOnFileEvent({ ...evt, firstEventInAttempt });
+      } catch (cbErr) {
+        console.error(`[ai] user onFileEvent threw`, cbErr);
+      }
+    }
+  };
 
   let lastError;
   const transientRetryCount = Number.isFinite(Number(options.transientRetryCount))
@@ -1245,16 +1303,19 @@ export async function createAiResponse(context, options = {}) {
       imageCount = 0;
       imageActivity = false;
       fileCount = 0;
+      fileActivity = false;
       try {
         const result = provider === "anthropic"
           ? await callAnthropic(model, context, systemPrompt, onDelta, {
-              onFile: wrappedOnFile
+              onFile: wrappedOnFile,
+              onFileEvent
             })
           : await callCodex(model, context, systemPrompt, webSearch, onDelta, {
               imageGeneration,
               onImage: wrappedOnImage,
               onImageEvent,
-              onFile: wrappedOnFile
+              onFile: wrappedOnFile,
+              onFileEvent
             });
 
         if (result || imageCount > 0 || fileCount > 0) {

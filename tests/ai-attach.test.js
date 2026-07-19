@@ -1085,6 +1085,174 @@ test("B4 createAiResponse: onFile appends attach_file guidance to the system pro
     });
     assert.ok(bodies[0].instructions.startsWith("base prompt"), "original prompt kept");
     assert.ok(bodies[0].instructions.includes("attach_file"), "guidance must be appended");
+    assert.ok(
+      bodies[0].instructions.includes("Before calling attach_file, first write and stream"),
+      "guidance must require body text before the tool call"
+    );
+    assert.ok(
+      bodies[0].instructions.includes("Answer inline in the message body by default") &&
+        bodies[0].instructions.includes("length alone is never a reason") &&
+        bodies[0].instructions.includes("When uncertain, answer inline"),
+      "guidance must make conservative inline output the default"
+    );
+    assert.ok(
+      bodies[0].instructions.includes("user explicitly asks for a file or download") &&
+        bodies[0].instructions.includes("complete standalone deliverable"),
+      "guidance must limit attachments to explicit requests or clearly useful standalone outputs"
+    );
+    assert.ok(
+      !bodies[0].instructions.includes("30 lines") &&
+        !bodies[0].instructions.includes("1500 characters"),
+      "guidance must not use an automatic length threshold"
+    );
+  } finally {
+    fetchMock.restore();
+    authStub.restore();
+  }
+});
+
+test("B4 createAiResponse: codex announces attach_file at output_item.added once per call", async () => {
+  const authStub = installCodexAuth();
+  let calls = 0;
+  const fetchMock = installFetchMock(
+    makeCodexFetchHandler(() => {
+      calls++;
+      if (calls > 1) {
+        return sseEvent({ type: "response.output_text.delta", delta: "done" });
+      }
+      return sseEvent({
+        type: "response.output_item.added",
+        item: { type: "function_call", id: "fc_early", call_id: "call_early", name: "attach_file" }
+      }) +
+      sseEvent({
+        type: "response.output_item.done",
+        item: {
+          type: "function_call",
+          id: "fc_early",
+          call_id: "call_early",
+          name: "attach_file",
+          arguments: JSON.stringify({ filename: "early.txt", content: "x" })
+        }
+      });
+    })
+  );
+
+  try {
+    const events = [];
+    await createAiResponse([{ role: "user", content: "file" }], {
+      model: "gpt-5",
+      emptyRetryCount: 0,
+      onFile: () => {},
+      onFileEvent: (event) => events.push(event)
+    });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "response.output_item.added");
+    assert.equal(events[0].firstEventInAttempt, true);
+  } finally {
+    fetchMock.restore();
+    authStub.restore();
+  }
+});
+
+test("B4 createAiResponse: anthropic announces attach_file at content_block_start", async () => {
+  const keyStub = installAnthropicKey();
+  let calls = 0;
+  const fetchMock = installFetchMock(
+    makeAnthropicFetchHandler(() => {
+      calls++;
+      return calls === 1
+        ? anthropicToolCallRound1Sse()
+        : sseEvent({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } }) +
+          sseEvent({ type: "message_delta", delta: { stop_reason: "end_turn" } });
+    })
+  );
+
+  try {
+    const events = [];
+    await createAiResponse([{ role: "user", content: "file" }], {
+      model: "claude-sonnet-4-5",
+      providers: { anthropic: { models: ["claude-sonnet-4-5"] } },
+      emptyRetryCount: 0,
+      onFile: () => {},
+      onFileEvent: (event) => events.push(event)
+    });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "content_block_start");
+    assert.equal(events[0].firstEventInAttempt, true);
+  } finally {
+    fetchMock.restore();
+    keyStub.restore();
+  }
+});
+
+test("B4 createAiResponse: file event firstEventInAttempt resets on empty retry", async () => {
+  const authStub = installCodexAuth();
+  let calls = 0;
+  const fetchMock = installFetchMock(
+    makeCodexFetchHandler(() => {
+      calls++;
+      return sseEvent({
+        type: "response.output_item.added",
+        item: {
+          type: "function_call",
+          id: `fc_retry_${calls}`,
+          call_id: `call_retry_${calls}`,
+          name: "attach_file"
+        }
+      });
+    })
+  );
+
+  try {
+    const events = [];
+    await createAiResponse([{ role: "user", content: "file" }], {
+      model: "gpt-5",
+      emptyRetryCount: 1,
+      onFile: () => {},
+      onFileEvent: (event) => events.push(event)
+    });
+    assert.equal(calls, 2);
+    assert.deepEqual(events.map((event) => event.firstEventInAttempt), [true, true]);
+  } finally {
+    fetchMock.restore();
+    authStub.restore();
+  }
+});
+
+test("B4 createAiResponse: multiple file calls in one attempt mark only the first event", async () => {
+  const authStub = installCodexAuth();
+  let calls = 0;
+  const fetchMock = installFetchMock(
+    makeCodexFetchHandler(() => {
+      calls++;
+      if (calls > 1) {
+        return sseEvent({ type: "response.output_text.delta", delta: "done" });
+      }
+      return ["one", "two"].map((suffix) =>
+        sseEvent({
+          type: "response.output_item.done",
+          item: {
+            type: "function_call",
+            id: `fc_${suffix}`,
+            call_id: `call_${suffix}`,
+            name: "attach_file",
+            arguments: JSON.stringify({ filename: `${suffix}.txt`, content: suffix })
+          }
+        })
+      ).join("");
+    })
+  );
+
+  try {
+    const events = [];
+    await createAiResponse([{ role: "user", content: "two files" }], {
+      model: "gpt-5",
+      emptyRetryCount: 0,
+      onFile: () => {},
+      onFileEvent: (event) => events.push(event)
+    });
+    assert.equal(events.length, 2);
+    assert.deepEqual(events.map((event) => event.firstEventInAttempt), [true, false]);
   } finally {
     fetchMock.restore();
     authStub.restore();

@@ -1,6 +1,7 @@
 import { AttachmentBuilder, Client, EmbedBuilder, GatewayIntentBits, Partials } from "discord.js";
 import { createAiResponse } from "../ai.js";
 import { isTextLike, fetchTextAttachmentBlock, maxTextFilesInContext } from "./attachments.js";
+import { markdownChunk } from "./markdown-chunks.js";
 
 /**
  * Sanitize a Codex item id so it is safe to use as a filename component.
@@ -478,34 +479,6 @@ export async function startDiscordBot(config, options) {
 
   const discordMaxLength = 2000;
 
-  function capDiscordText(text = "") {
-    if (!text.trim()) {
-      return ".";
-    }
-
-    if (text.length <= discordMaxLength) {
-      return text;
-    }
-
-    return text.slice(0, discordMaxLength);
-  }
-
-  function splitDiscordText(text = "") {
-    if (!text.trim()) {
-      return ["."];
-    }
-
-    if (text.length <= discordMaxLength) {
-      return [text];
-    }
-
-    const chunks = [];
-    for (let i = 0; i < text.length; i += discordMaxLength) {
-      chunks.push(text.slice(i, i + discordMaxLength));
-    }
-    return chunks;
-  }
-
   function isDiscordTooLong(error) {
     return error?.code === 50035 || String(error?.message || "").includes("2000 or fewer");
   }
@@ -588,6 +561,7 @@ export async function startDiscordBot(config, options) {
     const collectedFiles = [];
     const imageGenerationEnabled = config.imageGeneration === true;
     let imageProgressMessage = null;
+    let fileProgressMessage = null;
 
     try {
       try {
@@ -603,7 +577,7 @@ export async function startDiscordBot(config, options) {
         return;
       }
 
-      const updateReply = async (text, force = false) => {
+      const updateReply = async (source, offset, force = false) => {
         if (!replyMessage) {
           return 0;
         }
@@ -613,11 +587,12 @@ export async function startDiscordBot(config, options) {
           return;
         }
 
-        const content = capDiscordText(text);
+        const chunk = markdownChunk(source, offset, discordMaxLength);
+        const content = chunk.text;
         try {
           await replyMessage.edit(content);
           lastUpdateAt = now;
-          return content === "." ? 0 : content.length;
+          return chunk.consumedLength;
         } catch (error) {
           if (!isDiscordTooLong(error)) {
             throw error;
@@ -627,10 +602,10 @@ export async function startDiscordBot(config, options) {
             throw error;
           }
 
-          const consumedLength = Math.floor(content.length / 2);
-          await replyMessage.edit(content.slice(0, consumedLength) || ".");
+          const fallback = markdownChunk(source, offset, Math.floor(discordMaxLength / 2));
+          await replyMessage.edit(fallback.text);
           lastUpdateAt = now;
-          return consumedLength;
+          return fallback.consumedLength;
         }
       };
 
@@ -665,35 +640,39 @@ export async function startDiscordBot(config, options) {
         });
       };
 
-      const postMessage = async (text) => {
-        const content = capDiscordText(text);
+      const postMessage = async (source, offset) => {
+        const chunk = markdownChunk(source, offset, discordMaxLength);
+        const content = chunk.text;
         try {
           const reply = await sendChunk(content);
-          return { reply, consumedLength: content === "." ? 0 : content.length };
+          return { reply, consumedLength: chunk.consumedLength };
         } catch (error) {
           if (!isDiscordTooLong(error) || content.length <= 1) {
             throw error;
           }
 
-          const consumedLength = Math.floor(content.length / 2);
-          const fallbackContent = content.slice(0, consumedLength) || ".";
-          const reply = await sendChunk(fallbackContent);
-          return { reply, consumedLength };
+          const fallback = markdownChunk(source, offset, Math.floor(discordMaxLength / 2));
+          const reply = await sendChunk(fallback.text);
+          return { reply, consumedLength: fallback.consumedLength };
         }
       };
 
       const syncReply = async (force = false) => {
         while (true) {
           const currentText = streamedText.slice(currentMsgOffset);
-          if (!currentText.trim()) {
+          if (!currentText.length) {
+            return;
+          }
+          if (!currentText.trim() && (replyMessage || currentMsgOffset > 0)) {
+            currentMsgOffset += currentText.length;
             return;
           }
 
           let consumedLength = 0;
           if (replyMessage) {
-            consumedLength = await updateReply(currentText, force);
+            consumedLength = await updateReply(streamedText, currentMsgOffset, force);
           } else {
-            const result = await postMessage(currentText);
+            const result = await postMessage(streamedText, currentMsgOffset);
             replyMessage = result.reply;
             lastChunkMessage = result.reply;
             lastUpdateAt = Date.now();
@@ -739,6 +718,22 @@ export async function startDiscordBot(config, options) {
         imageGeneration: imageGenerationEnabled,
         onFile: (file) => {
           collectedFiles.push(file);
+        },
+        onFileEvent: async (evt) => {
+          if (!evt?.firstEventInAttempt || fileProgressMessage) {
+            return;
+          }
+          try {
+            fileProgressMessage = await message.channel.send({
+              content: "📎 파일 생성 중...",
+              allowedMentions: { parse: [] },
+              reply: message?.id
+                ? { messageReference: message.id, failIfNotExists: false }
+                : undefined
+            });
+          } catch (err) {
+            console.error("[discord][file_progress] failed", err);
+          }
         },
         onImage: imageGenerationEnabled
           ? (buffer, meta) => {
@@ -858,6 +853,14 @@ export async function startDiscordBot(config, options) {
         }
         imageProgressMessage = null;
       }
+      if (fileProgressMessage) {
+        try {
+          await fileProgressMessage.delete();
+          fileProgressMessage = null;
+        } catch (err) {
+          console.error("[discord][file_progress] cleanup failed", err);
+        }
+      }
     } catch (error) {
       console.error("[discord][message] error", error);
       if (collectedFiles.length > 0) {
@@ -905,6 +908,14 @@ export async function startDiscordBot(config, options) {
           await imageProgressMessage.delete();
         } catch (err) {
           console.error("[discord][image_progress] cleanup failed (finally)", err);
+        }
+      }
+
+      if (fileProgressMessage) {
+        try {
+          await fileProgressMessage.delete();
+        } catch (err) {
+          console.error("[discord][file_progress] cleanup failed (finally)", err);
         }
       }
 

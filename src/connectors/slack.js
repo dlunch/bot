@@ -1,6 +1,7 @@
 import SlackBolt from "@slack/bolt";
 import { createAiResponse } from "../ai.js";
 import { isTextLike, fetchTextAttachmentBlock, maxTextFilesInContext } from "./attachments.js";
+import { markdownChunk } from "./markdown-chunks.js";
 
 const { App, SocketModeReceiver } = SlackBolt;
 
@@ -212,34 +213,6 @@ export async function startSlackBot(config, options) {
     return new Promise((resolve) => {
       setTimeout(resolve, ms);
     });
-  }
-
-  function toSlackText(text = "") {
-    if (!text.trim()) {
-      return ".";
-    }
-
-    if (text.length <= slackMaxLength) {
-      return text;
-    }
-
-    return text.slice(0, slackMaxLength);
-  }
-
-  function splitSlackText(text = "") {
-    if (!text.trim()) {
-      return ["."];
-    }
-
-    if (text.length <= slackMaxLength) {
-      return [text];
-    }
-
-    const chunks = [];
-    for (let i = 0; i < text.length; i += slackMaxLength) {
-      chunks.push(text.slice(i, i + slackMaxLength));
-    }
-    return chunks;
   }
 
   function isMsgTooLong(error) {
@@ -547,6 +520,7 @@ export async function startSlackBot(config, options) {
     const collectedFiles = [];
     const imageGenerationEnabled = config.imageGeneration === true;
     let imageProgressNoticeTs = null;
+    let fileProgressNoticeTs = null;
 
     try {
       try {
@@ -572,8 +546,9 @@ export async function startSlackBot(config, options) {
       }
       let lastUpdateAt = 0;
 
-      const postMessage = async (text) => {
-        const content = toSlackText(text);
+      const postMessage = async (source, offset) => {
+        const chunk = markdownChunk(source, offset, slackMaxLength);
+        const content = chunk.text;
         try {
           const reply = await withSlackRetry(() => client.chat.postMessage({
             channel: event.channel,
@@ -582,25 +557,25 @@ export async function startSlackBot(config, options) {
             parse: "none",
             mrkdwn: true
           }), "post_message");
-          return { reply, consumedLength: content === "." ? 0 : content.length };
+          return { reply, consumedLength: chunk.consumedLength };
         } catch (error) {
           if (!isMsgTooLong(error) || content.length <= 1) {
             throw error;
           }
 
-          const consumedLength = Math.floor(content.length / 2);
+          const fallback = markdownChunk(source, offset, Math.floor(slackMaxLength / 2));
           const reply = await withSlackRetry(() => client.chat.postMessage({
             channel: event.channel,
             ...(inDm ? {} : { thread_ts: threadTs }),
-            text: content.slice(0, consumedLength) || ".",
+            text: fallback.text,
             parse: "none",
             mrkdwn: true
           }), "post_message");
-          return { reply, consumedLength };
+          return { reply, consumedLength: fallback.consumedLength };
         }
       };
 
-      const updateReply = async (text, force = false) => {
+      const updateReply = async (source, offset, force = false) => {
         if (!replyTs) {
           return 0;
         }
@@ -610,7 +585,8 @@ export async function startSlackBot(config, options) {
           return;
         }
 
-        const content = toSlackText(text);
+        const chunk = markdownChunk(source, offset, slackMaxLength);
+        const content = chunk.text;
         try {
           await withSlackRetry(() => client.chat.update({
             channel: event.channel,
@@ -620,7 +596,7 @@ export async function startSlackBot(config, options) {
             mrkdwn: true
           }), "chat_update");
           lastUpdateAt = now;
-          return content === "." ? 0 : content.length;
+          return chunk.consumedLength;
         } catch (error) {
           if (!isMsgTooLong(error)) {
             throw error;
@@ -630,31 +606,35 @@ export async function startSlackBot(config, options) {
             throw error;
           }
 
-          const consumedLength = Math.floor(content.length / 2);
+          const fallback = markdownChunk(source, offset, Math.floor(slackMaxLength / 2));
           await withSlackRetry(() => client.chat.update({
             channel: event.channel,
             ts: replyTs,
-            text: content.slice(0, consumedLength) || ".",
+            text: fallback.text,
             parse: "none",
             mrkdwn: true
           }), "chat_update");
           lastUpdateAt = now;
-          return consumedLength;
+          return fallback.consumedLength;
         }
       };
 
       const syncReply = async (force = false) => {
         while (true) {
           const currentText = streamedText.slice(currentMsgOffset);
-          if (!currentText.trim()) {
+          if (!currentText.length) {
+            return;
+          }
+          if (!currentText.trim() && (replyTs || currentMsgOffset > 0)) {
+            currentMsgOffset += currentText.length;
             return;
           }
 
           let consumedLength = 0;
           if (replyTs) {
-            consumedLength = await updateReply(currentText, force);
+            consumedLength = await updateReply(streamedText, currentMsgOffset, force);
           } else {
-            const result = await postMessage(currentText);
+            const result = await postMessage(streamedText, currentMsgOffset);
             replyTs = result.reply.ts;
             lastUpdateAt = Date.now();
             consumedLength = result.consumedLength;
@@ -699,6 +679,29 @@ export async function startSlackBot(config, options) {
         imageGeneration: imageGenerationEnabled,
         onFile: (file) => {
           collectedFiles.push(file);
+        },
+        onFileEvent: async (evt) => {
+          if (!evt?.firstEventInAttempt || fileProgressNoticeTs) {
+            return;
+          }
+          try {
+            const res = await withSlackRetry(
+              () => client.chat.postMessage({
+                channel: event.channel,
+                thread_ts: inDm ? undefined : threadTs,
+                text: "📎 파일 생성 중...",
+                parse: "none",
+                mrkdwn: true
+              }),
+              "file_progress_notice"
+            );
+            fileProgressNoticeTs = res?.ts;
+          } catch (err) {
+            console.error(
+              `[slack][file_progress] failed name=${config.name} source=${source}`,
+              err?.data || err
+            );
+          }
         },
         onImage: imageGenerationEnabled
           ? (buffer, meta) => {
@@ -847,6 +850,17 @@ export async function startSlackBot(config, options) {
         }
         imageProgressNoticeTs = null;
       }
+      if (fileProgressNoticeTs) {
+        try {
+          await withSlackRetry(
+            () => client.chat.delete({ channel: event.channel, ts: fileProgressNoticeTs }),
+            "file_progress_cleanup"
+          );
+          fileProgressNoticeTs = null;
+        } catch (err) {
+          console.error(`[slack][file_progress] cleanup failed name=${config.name}`, err?.data || err);
+        }
+      }
 
     } catch (error) {
       console.error(`[slack][${source}] error`, error);
@@ -931,6 +945,20 @@ export async function startSlackBot(config, options) {
         } catch (err) {
           console.error(
             `[slack][image_progress] cleanup failed (finally) name=${config.name}`,
+            err?.data || err
+          );
+        }
+      }
+
+      if (fileProgressNoticeTs) {
+        try {
+          await withSlackRetry(
+            () => client.chat.delete({ channel: event.channel, ts: fileProgressNoticeTs }),
+            "file_progress_cleanup"
+          );
+        } catch (err) {
+          console.error(
+            `[slack][file_progress] cleanup failed (finally) name=${config.name}`,
             err?.data || err
           );
         }
