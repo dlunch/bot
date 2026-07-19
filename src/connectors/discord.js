@@ -96,6 +96,44 @@ export async function deliverDiscordImages(message, { images } = {}) {
   }
 }
 
+export async function deliverDiscordFiles(message, { files } = {}) {
+  if (!Array.isArray(files) || files.length === 0) return;
+  const channel = message?.channel;
+  if (!channel || typeof channel.send !== "function") {
+    console.error("[discord][file_upload] missing channel.send; cannot deliver files");
+    return;
+  }
+
+  for (const file of files) {
+    try {
+      const attachment = new AttachmentBuilder(Buffer.from(file.content, "utf8"), {
+        name: file.filename
+      });
+      await channel.send({
+        files: [attachment],
+        allowedMentions: { parse: [] },
+        reply: message?.id
+          ? { messageReference: message.id, failIfNotExists: false }
+          : undefined
+      });
+      console.log(`[discord][file_deliver] filename=${file.filename}`);
+    } catch (err) {
+      console.error(`[discord][file_upload] failed filename=${file?.filename}`, err);
+      try {
+        await channel.send({
+          content: `⚠️ 파일 첨부 실패 (${file?.filename}): ${err?.message || "unknown"}`.slice(0, 2000),
+          allowedMentions: { parse: [] }
+        });
+      } catch (notifyErr) {
+        console.error(
+          `[discord][file_upload] failure notice also failed filename=${file?.filename}`,
+          notifyErr
+        );
+      }
+    }
+  }
+}
+
 export async function startDiscordBot(config, options) {
   const { maxThreadHistory, discordStreamUpdateMs } = options;
   const client = new Client({
@@ -547,6 +585,7 @@ export async function startDiscordBot(config, options) {
     // during streaming and delivered after text sync completes so the text
     // response shows up first (per arch §7.2 UX decision).
     const collectedImages = [];
+    const collectedFiles = [];
     const imageGenerationEnabled = config.imageGeneration === true;
     let imageProgressMessage = null;
 
@@ -698,6 +737,9 @@ export async function startDiscordBot(config, options) {
         webSearch: config.webSearch,
         systemPrompt: config.systemPrompt,
         imageGeneration: imageGenerationEnabled,
+        onFile: (file) => {
+          collectedFiles.push(file);
+        },
         onImage: imageGenerationEnabled
           ? (buffer, meta) => {
               collectedImages.push({
@@ -755,7 +797,7 @@ export async function startDiscordBot(config, options) {
         pendingUpdate = null;
       }
 
-      if (!rawAnswer && !streamedText.trim() && collectedImages.length === 0) {
+      if (!rawAnswer && !streamedText.trim() && collectedImages.length === 0 && collectedFiles.length === 0) {
         const modelList = (config.models || []).join(", ") || "(none)";
         console.error(
           `[discord][message] empty response after retries models=${modelList}`
@@ -766,10 +808,10 @@ export async function startDiscordBot(config, options) {
       }
       await runSyncReply(true);
 
-      // Image delivery (post-text, arch §7.2). If we have images but no text,
+      // Attachment delivery (post-text). If we have attachments but no text,
       // post a placeholder message first (M-5) so thread history keeps an
       // assistant turn for continuity.
-      if (collectedImages.length > 0) {
+      if (collectedFiles.length > 0 || collectedImages.length > 0) {
         if (!streamedText.trim()) {
           // H-2: reply w/ messageReference + failIfNotExists:false already
           // degrades silently when the original message is gone. If the send
@@ -778,7 +820,7 @@ export async function startDiscordBot(config, options) {
           // buildContext needs for continuity (M-5).
           try {
             await message.channel.send({
-              content: "이미지를 생성했습니다.",
+              content: collectedFiles.length > 0 ? "파일을 첨부했습니다." : "이미지를 생성했습니다.",
               allowedMentions: { parse: [] },
               reply: { messageReference: message.id, failIfNotExists: false }
             });
@@ -789,7 +831,7 @@ export async function startDiscordBot(config, options) {
             );
             try {
               await message.channel.send({
-                content: "이미지를 생성했습니다.",
+                content: collectedFiles.length > 0 ? "파일을 첨부했습니다." : "이미지를 생성했습니다.",
                 allowedMentions: { parse: [] }
               });
             } catch (retryErr) {
@@ -800,6 +842,11 @@ export async function startDiscordBot(config, options) {
             }
           }
         }
+        if (collectedFiles.length > 0) {
+          await deliverDiscordFiles(message, { files: collectedFiles });
+        }
+      }
+      if (collectedImages.length > 0) {
         await deliverDiscordImages(message, { images: collectedImages });
       }
 
@@ -813,6 +860,11 @@ export async function startDiscordBot(config, options) {
       }
     } catch (error) {
       console.error("[discord][message] error", error);
+      if (collectedFiles.length > 0) {
+        console.error(
+          `[discord] dropped ${collectedFiles.length} partial files due to stream error`
+        );
+      }
       if (collectedImages.length > 0) {
         console.error(
           `[discord] dropped ${collectedImages.length} partial images due to stream error`

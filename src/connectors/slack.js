@@ -114,6 +114,49 @@ export async function deliverSlackImages(client, images, ctx = {}) {
   }
 }
 
+export async function deliverSlackFiles(client, files, ctx = {}) {
+  if (!Array.isArray(files) || files.length === 0) return;
+  const { channelId, threadTs, source = "file", name = "", withRetry } = ctx;
+  const runWithRetry = typeof withRetry === "function" ? withRetry : async (fn) => fn();
+
+  for (const file of files) {
+    try {
+      await runWithRetry(
+        () => client.filesUploadV2({
+          channel_id: channelId,
+          thread_ts: threadTs,
+          file: Buffer.from(file.content, "utf8"),
+          filename: file.filename
+        }),
+        "files_upload_v2"
+      );
+      console.log(`[slack][file_deliver] name=${name} source=${source} filename=${file.filename}`);
+    } catch (err) {
+      console.error(
+        `[slack][file_upload] failed name=${name} source=${source} filename=${file?.filename}`,
+        err?.data || err
+      );
+      const safeReason = sanitizeSlackMentions(
+        String(err?.data?.error || err?.message || "unknown")
+      );
+      try {
+        await client.chat.postMessage({
+          channel: channelId,
+          thread_ts: threadTs,
+          text: sanitizeSlackMentions(`⚠️ 파일 첨부 실패 (${file?.filename}): ${safeReason}`),
+          parse: "none",
+          mrkdwn: true
+        });
+      } catch (notifyErr) {
+        console.error(
+          `[slack][file_upload] failure notice also failed filename=${file?.filename}`,
+          notifyErr?.data || notifyErr
+        );
+      }
+    }
+  }
+}
+
 export async function startSlackBot(config, options) {
   const { maxThreadHistory, slackStreamUpdateMs } = options;
   const receiver = new SocketModeReceiver({
@@ -501,6 +544,7 @@ export async function startSlackBot(config, options) {
     // Collected image payloads from the AI layer's onImage callback. These
     // are buffered during streaming and delivered after text sync completes.
     const collectedImages = [];
+    const collectedFiles = [];
     const imageGenerationEnabled = config.imageGeneration === true;
     let imageProgressNoticeTs = null;
 
@@ -653,6 +697,9 @@ export async function startSlackBot(config, options) {
         webSearch: config.webSearch,
         systemPrompt: config.systemPrompt,
         imageGeneration: imageGenerationEnabled,
+        onFile: (file) => {
+          collectedFiles.push(file);
+        },
         onImage: imageGenerationEnabled
           ? (buffer, meta) => {
               collectedImages.push({
@@ -718,7 +765,7 @@ export async function startSlackBot(config, options) {
         pendingUpdate = null;
       }
 
-      if (!rawAnswer && !streamedText.trim() && collectedImages.length === 0) {
+      if (!rawAnswer && !streamedText.trim() && collectedImages.length === 0 && collectedFiles.length === 0) {
         const modelList = (config.models || []).join(", ") || "(none)";
         console.error(
           `[slack][${source}] empty response after retries models=${modelList}`
@@ -734,7 +781,7 @@ export async function startSlackBot(config, options) {
       // no text at all, post a small placeholder message first so the thread
       // history still contains an assistant turn for the next round of
       // buildThreadContext to pick up.
-      if (collectedImages.length > 0) {
+      if (collectedFiles.length > 0 || collectedImages.length > 0) {
         // In channels (and in thread replies), always anchor to the thread so
         // the placeholder + image attachments stay grouped with the original
         // question. In DMs with no thread context, post at the DM root like
@@ -748,7 +795,7 @@ export async function startSlackBot(config, options) {
                 client.chat.postMessage({
                   channel: event.channel,
                   thread_ts: uploadThreadTs,
-                  text: "이미지를 생성했습니다.",
+                  text: collectedFiles.length > 0 ? "파일을 첨부했습니다." : "이미지를 생성했습니다.",
                   parse: "none",
                   mrkdwn: true
                 }),
@@ -761,6 +808,18 @@ export async function startSlackBot(config, options) {
             );
           }
         }
+        if (collectedFiles.length > 0) {
+          await deliverSlackFiles(client, collectedFiles, {
+            channelId: event.channel,
+            threadTs: uploadThreadTs,
+            source,
+            name: config.name,
+            withRetry: withSlackRetry
+          });
+        }
+      }
+      if (collectedImages.length > 0) {
+        const uploadThreadTs = inDm ? undefined : threadTs;
         await deliverSlackImages(client, collectedImages, {
           channelId: event.channel,
           threadTs: uploadThreadTs,
@@ -791,6 +850,11 @@ export async function startSlackBot(config, options) {
 
     } catch (error) {
       console.error(`[slack][${source}] error`, error);
+      if (collectedFiles.length > 0) {
+        console.error(
+          `[slack] dropped ${collectedFiles.length} partial files due to stream error name=${config.name} source=${source}`
+        );
+      }
       if (collectedImages.length > 0) {
         // Drop partially-collected images on stream error (H-2). We only log
         // the count so operators can correlate with upstream issues; we do

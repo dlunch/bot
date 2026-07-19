@@ -15,6 +15,135 @@ const anthropicDefaultMaxTokens = 16384;
 
 const defaultSystemPrompt = "You are a concise and helpful assistant. Continue the conversation naturally using the context.";
 
+const attachFileToolName = "attach_file";
+const attachFileDescription =
+  "Attach a text file to the reply instead of pasting long content into the message body. " +
+  "Use for long code or long text. The file is delivered to the user as a download.";
+const attachFileSchema = {
+  type: "object",
+  properties: {
+    filename: { type: "string", description: "File name with extension, e.g. solution.py" },
+    content: { type: "string", description: "Complete file content (UTF-8 text)" }
+  },
+  required: ["filename", "content"],
+  additionalProperties: false
+};
+const codexAttachFileTool = {
+  type: "function",
+  name: attachFileToolName,
+  description: attachFileDescription,
+  parameters: attachFileSchema,
+  strict: false
+};
+const anthropicAttachFileTool = {
+  name: attachFileToolName,
+  description: attachFileDescription,
+  input_schema: attachFileSchema
+};
+
+const maxAttachFilesPerResponse = 5;
+const maxAttachFileBytes = 1024 * 1024;
+const maxToolRounds = 5;
+const maxAttachFilenameLength = 80;
+
+const attachFileGuidance =
+  "When your reply would include long code or long text (roughly more than 30 lines or " +
+  "1500 characters), call the attach_file tool with a suitable filename and the COMPLETE " +
+  "content, and keep only a brief explanation in the message body. Never repeat attached " +
+  "file content in the body. For short snippets, answer inline with normal code blocks.";
+
+// Extensions that render (with scripts) on open in a browser or auto-execute /
+// follow links on double-click on Windows. Regular scripts (.sh/.py/.bat/...)
+// are intentionally allowed: delivering runnable scripts is the core use case
+// and they require a conscious execution step, same risk class as a code block.
+const dangerousAttachmentExtensions = new Set([
+  "html", "htm", "xhtml", "svg", "lnk", "url", "hta", "vbs", "wsf", "scr"
+]);
+
+function sanitizeAttachmentFilename(name) {
+  const lastSegment = String(name || "").split(/[/\\]/).pop() || "";
+  let sanitized = lastSegment
+    .replace(/[^A-Za-z0-9._-]/g, "_")
+    .replace(/^\.+/, "")
+    .replace(/\.+$/, "");
+  if (!sanitized || /^_+$/.test(sanitized)) {
+    sanitized = "attachment.txt";
+  }
+
+  const extIndex = sanitized.lastIndexOf(".");
+  const ext = extIndex >= 0 ? sanitized.slice(extIndex + 1).toLowerCase() : "";
+  if (dangerousAttachmentExtensions.has(ext)) {
+    sanitized += ".txt";
+  }
+
+  if (sanitized.length > maxAttachFilenameLength) {
+    const dot = sanitized.lastIndexOf(".");
+    if (dot > 0 && sanitized.length - dot < maxAttachFilenameLength) {
+      const suffix = sanitized.slice(dot);
+      const keep = maxAttachFilenameLength - suffix.length;
+      sanitized = sanitized.slice(0, dot).slice(0, keep) + suffix;
+    } else {
+      sanitized = sanitized.slice(0, maxAttachFilenameLength);
+    }
+  }
+
+  return sanitized;
+}
+
+function createAttachFileHandler(onFile) {
+  let attachedCount = 0;
+
+  return async function handleAttachFile(rawArgs) {
+    let args = rawArgs;
+    if (typeof rawArgs === "string") {
+      try {
+        args = JSON.parse(rawArgs);
+      } catch {
+        console.warn("[ai] attach_file called with invalid JSON arguments");
+        return { output: "Error: invalid JSON arguments", isError: true };
+      }
+    }
+
+    const filename = args?.filename;
+    const content = args?.content;
+    if (typeof filename !== "string" || !filename.trim() || typeof content !== "string" || !content) {
+      return { output: "Error: filename and content must be non-empty strings", isError: true };
+    }
+
+    if (attachedCount >= maxAttachFilesPerResponse) {
+      console.warn(
+        `[ai] attach_file limit (${maxAttachFilesPerResponse}) reached; ignoring "${filename}"`
+      );
+      return {
+        output: `Error: file limit (${maxAttachFilesPerResponse}) reached; put remaining content in the message body`,
+        isError: true
+      };
+    }
+
+    const byteLength = Buffer.byteLength(content, "utf8");
+    if (byteLength > maxAttachFileBytes) {
+      console.warn(
+        `[ai] attach_file content too large (${byteLength} bytes > ${maxAttachFileBytes}); ignoring "${filename}"`
+      );
+      return {
+        output: `Error: file exceeds the ${maxAttachFileBytes} byte limit; shorten or split the content`,
+        isError: true
+      };
+    }
+
+    const sanitized = sanitizeAttachmentFilename(filename);
+    try {
+      await onFile({ filename: sanitized, content });
+    } catch (cbErr) {
+      console.error(`[ai] onFile callback threw for "${sanitized}"`, cbErr);
+      return { output: "Error: failed to deliver the file", isError: true };
+    }
+
+    attachedCount++;
+    return { output: `File "${sanitized}" attached and delivered to the user.`, isError: false };
+  };
+}
+
 let codexAuthState;
 let refreshInFlight;
 
@@ -319,7 +448,10 @@ function parseSseResponse(raw) {
       continue;
     }
 
-    const maybeText = extractOutputTextFromEvent(event);
+    const maybeText =
+      event?.type === "response.output_item.done" && event.item?.type === "message"
+        ? extractOutputText({ output: [event.item] })
+        : extractOutputTextFromEvent(event);
     if (maybeText) {
       fallbackText = maybeText;
     }
@@ -328,7 +460,7 @@ function parseSseResponse(raw) {
   return deltaText.trim() || fallbackText.trim();
 }
 
-async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent) {
+async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemCollector) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -379,6 +511,35 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent) {
         await onDelta(event.delta, deltaText);
       }
       return;
+    }
+
+    // function_call arguments stream as deltas too, but the complete JSON string
+    // arrives on the output_item.done item below (same approach as
+    // image_generation_call). Consume these events so they never reach the
+    // fallback text extraction.
+    if (
+      typeof event?.type === "string" &&
+      event.type.startsWith("response.function_call_arguments.")
+    ) {
+      return;
+    }
+
+    if (
+      itemCollector &&
+      event?.type === "response.output_item.done" &&
+      (event.item?.type === "message" ||
+        event.item?.type === "function_call" ||
+        event.item?.type === "reasoning")
+    ) {
+      // Items are re-sent verbatim on tool follow-up requests (store:false), so
+      // keep them untouched — reasoning<->function_call pairing relies on ids.
+      itemCollector.items.push(event.item);
+      // A message item may be the only carrier of output text when the server
+      // omits output_text.delta events. Preserve it for follow-up replay while
+      // still allowing fallback extraction below.
+      if (event.item.type !== "message") {
+        return;
+      }
     }
 
     // Image generation lifecycle events: in_progress, generating, partial_image,
@@ -445,7 +606,10 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent) {
       return;
     }
 
-    const maybeText = extractOutputTextFromEvent(event);
+    const maybeText =
+      event?.type === "response.output_item.done" && event.item?.type === "message"
+        ? extractOutputText({ output: [event.item] })
+        : extractOutputTextFromEvent(event);
     if (maybeText) {
       fallbackText = maybeText;
     }
@@ -514,11 +678,66 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent) {
   return deltaText.trim() || fallbackText.trim();
 }
 
-async function parseAnthropicSseStream(stream, onDelta) {
+async function parseAnthropicSseStream(stream, onDelta, blockCollector) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let deltaText = "";
+
+  const handleEvent = async (event) => {
+    if (
+      blockCollector &&
+      event?.type === "content_block_start" &&
+      event.content_block?.type === "tool_use" &&
+      Number.isInteger(event.index)
+    ) {
+      blockCollector.blocks[event.index] = {
+        type: "tool_use",
+        id: event.content_block.id,
+        name: event.content_block.name,
+        partialJson: ""
+      };
+      return;
+    }
+
+    if (event?.type === "content_block_delta" && event.delta?.type === "input_json_delta") {
+      const block = Number.isInteger(event.index) ? blockCollector?.blocks[event.index] : undefined;
+      if (block?.type === "tool_use" && typeof event.delta.partial_json === "string") {
+        block.partialJson += event.delta.partial_json;
+      }
+      return;
+    }
+
+    if (event?.delta?.type === "text_delta" && typeof event.delta.text === "string") {
+      deltaText += event.delta.text;
+      if (blockCollector && Number.isInteger(event.index)) {
+        const block = (blockCollector.blocks[event.index] ||= { type: "text", text: "" });
+        if (block.type === "text") {
+          block.text += event.delta.text;
+        }
+      }
+      if (onDelta) {
+        await onDelta(event.delta.text, deltaText);
+      }
+      return;
+    }
+
+    if (event?.type === "content_block_stop" && blockCollector && Number.isInteger(event.index)) {
+      const block = blockCollector.blocks[event.index];
+      if (block?.type === "tool_use") {
+        try {
+          block.input = JSON.parse(block.partialJson || "{}");
+        } catch {
+          block.parseError = true;
+        }
+      }
+      return;
+    }
+
+    if (event?.type === "message_delta" && blockCollector && event.delta?.stop_reason) {
+      blockCollector.stopReason = event.delta.stop_reason;
+    }
+  };
 
   while (true) {
     const { value, done } = await reader.read();
@@ -528,18 +747,19 @@ async function parseAnthropicSseStream(stream, onDelta) {
 
     buffer += decoder.decode(value, { stream: true });
     while (true) {
-      const splitIndex = buffer.indexOf("\n\n");
-      if (splitIndex === -1) {
+      const separator = /\r\n\r\n|\n\n|\r\r/.exec(buffer);
+      if (!separator) {
         break;
       }
 
-      const block = buffer.slice(0, splitIndex);
-      buffer = buffer.slice(splitIndex + 2);
+      const block = buffer.slice(0, separator.index);
+      buffer = buffer.slice(separator.index + separator[0].length);
 
       let data = "";
-      for (const line of block.split("\n")) {
-        if (line.startsWith("data:")) {
-          data = line.slice(5).trim();
+      for (const line of block.split(/\r\n|\n|\r/)) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("data:")) {
+          data = trimmed.slice(5).trim();
         }
       }
 
@@ -554,33 +774,20 @@ async function parseAnthropicSseStream(stream, onDelta) {
         continue;
       }
 
-      if (
-        event?.type === "content_block_delta" &&
-        event?.delta?.type === "text_delta" &&
-        typeof event.delta.text === "string"
-      ) {
-        deltaText += event.delta.text;
-        if (onDelta) {
-          await onDelta(event.delta.text, deltaText);
-        }
-      }
+      await handleEvent(event);
     }
   }
 
   buffer += decoder.decode();
   if (buffer.trim()) {
-    for (const line of buffer.split("\n")) {
-      if (!line.startsWith("data:")) {
+    for (const line of buffer.split(/\r\n|\n|\r/)) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) {
         continue;
       }
       try {
-        const event = JSON.parse(line.slice(5).trim());
-        if (event?.delta?.type === "text_delta" && typeof event.delta.text === "string") {
-          deltaText += event.delta.text;
-          if (onDelta) {
-            await onDelta(event.delta.text, deltaText);
-          }
-        }
+        const event = JSON.parse(trimmed.slice(5).trim());
+        await handleEvent(event);
       } catch {
         continue;
       }
@@ -648,6 +855,10 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
   }
 
   const imageGeneration = options?.imageGeneration === true;
+  const onImage = typeof options?.onImage === "function" ? options.onImage : undefined;
+  const onImageEvent =
+    typeof options?.onImageEvent === "function" ? options.onImageEvent : undefined;
+  const onFile = typeof options?.onFile === "function" ? options.onFile : undefined;
 
   const tools = [];
   if (webSearch) {
@@ -656,124 +867,294 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
   if (imageGeneration) {
     tools.push({ type: "image_generation", output_format: "png" });
   }
+  if (onFile) {
+    tools.push(codexAttachFileTool);
+  }
+  const handleAttachFile = onFile ? createAttachFileHandler(onFile) : undefined;
 
-  const body = {
-    model,
-    instructions: systemPrompt,
-    input: toResponsesInput(context),
-    tools,
-    tool_choice: "auto",
-    parallel_tool_calls: false,
-    store: false,
-    stream: true,
-    include: [],
-    prompt_cache_key: codexSessionId
+  let input = toResponsesInput(context);
+  // Single source of truth for text across tool rounds. Deltas and delta-less
+  // round fallbacks both merge here; onDelta's fullText spans round boundaries
+  // so connector stream-sync keeps working unmodified.
+  let cumulativeText = "";
+  let needSeparator = false;
+  const loopOnDelta = async (delta) => {
+    if (needSeparator) {
+      if (cumulativeText && !cumulativeText.endsWith("\n")) {
+        cumulativeText += "\n";
+      }
+      needSeparator = false;
+    }
+    cumulativeText += delta;
+    if (onDelta) {
+      await onDelta(delta, cumulativeText);
+    }
   };
 
-  if (process.env.CODEX_SSE_DEBUG === "1") {
-    process.stderr.write(
-      `[codex-sse][request] body=${JSON.stringify(body)}\n`
-    );
-  }
+  for (let round = 0; ; round++) {
+    const body = {
+      model,
+      instructions: systemPrompt,
+      input,
+      tools,
+      tool_choice: "auto",
+      parallel_tool_calls: false,
+      store: false,
+      stream: true,
+      // reasoning items must round-trip with encrypted_content under
+      // store:false, or follow-up requests carrying a function_call get 400.
+      include: handleAttachFile ? ["reasoning.encrypted_content"] : [],
+      prompt_cache_key: codexSessionId
+    };
 
-  let res = await requestCodexResponse(body, auth);
-  if ((res.status === 401 || res.status === 403) && auth.refreshToken) {
-    await refreshCodexAccessToken();
-    res = await requestCodexResponse(body, auth);
-  }
+    const collector = handleAttachFile ? { items: [] } : undefined;
+    const lenBefore = cumulativeText.length;
+    let roundText;
 
-  if (process.env.CODEX_SSE_DEBUG === "1") {
-    const headerDump = {};
-    for (const [k, v] of res.headers?.entries?.() || []) {
-      headerDump[k] = v;
+    try {
+      if (process.env.CODEX_SSE_DEBUG === "1") {
+        process.stderr.write(
+          `[codex-sse][request] body=${JSON.stringify(body)}\n`
+        );
+      }
+
+      let res = await requestCodexResponse(body, auth);
+      if ((res.status === 401 || res.status === 403) && auth.refreshToken) {
+        await refreshCodexAccessToken();
+        res = await requestCodexResponse(body, auth);
+      }
+
+      if (process.env.CODEX_SSE_DEBUG === "1") {
+        const headerDump = {};
+        for (const [k, v] of res.headers?.entries?.() || []) {
+          headerDump[k] = v;
+        }
+        process.stderr.write(
+          `[codex-sse][response] status=${res.status} headers=${JSON.stringify(headerDump)}\n`
+        );
+      }
+
+      if (res.status === 429) {
+        const raw = await res.text();
+        throw new RateLimitError("codex", model, extractErrorDetail(raw, parseJson(raw)));
+      }
+
+      if (!res.ok) {
+        const raw = await res.text();
+        throw new Error(`Codex request failed (model=${model}): ${extractErrorDetail(raw, parseJson(raw))}`);
+      }
+
+      if (res.body) {
+        roundText = await parseCodexSseStream(res.body, loopOnDelta, onImage, onImageEvent, collector);
+      } else {
+        // Non-streaming fallback: tool loop unsupported here, return text only.
+        const raw = await res.text();
+        const text = raw.includes("data:") ? parseSseResponse(raw) : extractOutputText(parseJson(raw));
+        if (cumulativeText.length === lenBefore && text) {
+          cumulativeText = cumulativeText
+            ? cumulativeText + (cumulativeText.endsWith("\n") ? "" : "\n") + text
+            : text;
+        }
+        return cumulativeText.trim();
+      }
+    } catch (err) {
+      // From round 2 on, round-1 text is already streamed to the connector and
+      // files delivered via onFile — model fallback would corrupt the posted
+      // stream, so end with partial success instead of throwing.
+      if (round === 0) {
+        throw err;
+      }
+      console.warn(`[ai] attach_file follow-up round ${round + 1} failed, returning partial text`, err);
+      return cumulativeText.trim();
     }
-    process.stderr.write(
-      `[codex-sse][response] status=${res.status} headers=${JSON.stringify(headerDump)}\n`
-    );
+
+    if (cumulativeText.length === lenBefore && roundText) {
+      cumulativeText = cumulativeText
+        ? cumulativeText + (cumulativeText.endsWith("\n") ? "" : "\n") + roundText
+        : roundText;
+    }
+
+    const functionCalls = (collector?.items || []).filter((it) => it?.type === "function_call");
+    if (!handleAttachFile || functionCalls.length === 0) {
+      return cumulativeText.trim();
+    }
+    if (round >= maxToolRounds) {
+      console.warn(`[ai] attach_file tool round limit reached (${maxToolRounds}), stopping loop`);
+      return cumulativeText.trim();
+    }
+
+    const outputs = [];
+    for (const fc of functionCalls) {
+      const result =
+        fc.name === attachFileToolName
+          ? await handleAttachFile(fc.arguments)
+          : { output: `Error: unknown tool ${fc.name}`, isError: true };
+      outputs.push({ type: "function_call_output", call_id: fc.call_id, output: result.output });
+    }
+
+    const hasMessageItem = collector.items.some((it) => it?.type === "message");
+    const assistantFallback =
+      !hasMessageItem && roundText ? [{ role: "assistant", content: roundText }] : [];
+    input = [...input, ...assistantFallback, ...collector.items, ...outputs];
+    needSeparator = true;
   }
-
-  if (res.status === 429) {
-    const raw = await res.text();
-    throw new RateLimitError("codex", model, extractErrorDetail(raw, parseJson(raw)));
-  }
-
-  if (!res.ok) {
-    const raw = await res.text();
-    throw new Error(`Codex request failed (model=${model}): ${extractErrorDetail(raw, parseJson(raw))}`);
-  }
-
-  const onImage = typeof options?.onImage === "function" ? options.onImage : undefined;
-  const onImageEvent =
-    typeof options?.onImageEvent === "function" ? options.onImageEvent : undefined;
-
-  if (res.body) {
-    return parseCodexSseStream(res.body, onDelta, onImage, onImageEvent);
-  }
-
-  const raw = await res.text();
-  if (raw.includes("data:")) {
-    return parseSseResponse(raw);
-  }
-
-  return extractOutputText(parseJson(raw));
 }
 
 function getAnthropicApiKey() {
   return readOptionalEnv("ANTHROPIC_API_KEY");
 }
 
-async function callAnthropic(model, context, systemPrompt, onDelta) {
+async function callAnthropic(model, context, systemPrompt, onDelta, options = {}) {
   const apiKey = getAnthropicApiKey();
     if (!apiKey) {
     throw new Error("Anthropic provider is not configured (ANTHROPIC_API_KEY env missing)");
   }
 
-  const messages = context.map((msg) => ({
+  const onFile = typeof options?.onFile === "function" ? options.onFile : undefined;
+  const handleAttachFile = onFile ? createAttachFileHandler(onFile) : undefined;
+
+  let messages = context.map((msg) => ({
     role: msg.role === "assistant" ? "assistant" : "user",
     content: msg.content
   }));
 
-  const res = await fetch(anthropicEndpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": anthropicVersion
-    },
-    body: JSON.stringify({
-      model,
-      system: systemPrompt,
-      messages,
-      max_tokens: anthropicDefaultMaxTokens,
-      stream: true
-    })
-  });
-
-  if (res.status === 429) {
-    const raw = await res.text();
-    throw new RateLimitError("anthropic", model, extractErrorDetail(raw, parseJson(raw)));
-  }
-
-  if (!res.ok) {
-    const raw = await res.text();
-    const payload = parseJson(raw);
-    if (payload?.error?.type === "rate_limit_error") {
-      throw new RateLimitError("anthropic", model, extractErrorDetail(raw, payload));
+  // Same round-spanning accumulation rules as the Codex tool loop (see there).
+  let cumulativeText = "";
+  let needSeparator = false;
+  const loopOnDelta = async (delta) => {
+    if (needSeparator) {
+      if (cumulativeText && !cumulativeText.endsWith("\n")) {
+        cumulativeText += "\n";
+      }
+      needSeparator = false;
     }
-    throw new Error(`Anthropic request failed (model=${model}): ${extractErrorDetail(raw, payload)}`);
-  }
+    cumulativeText += delta;
+    if (onDelta) {
+      await onDelta(delta, cumulativeText);
+    }
+  };
 
-  if (res.body) {
-    return parseAnthropicSseStream(res.body, onDelta);
-  }
+  for (let round = 0; ; round++) {
+    const collector = handleAttachFile ? { blocks: [], stopReason: undefined } : undefined;
+    const lenBefore = cumulativeText.length;
+    let roundText;
 
-  const raw = await res.text();
-  const payload = parseJson(raw);
-  return (payload?.content || [])
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("")
-    .trim();
+    try {
+      const res = await fetch(anthropicEndpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": anthropicVersion
+        },
+        body: JSON.stringify({
+          model,
+          system: systemPrompt,
+          messages,
+          max_tokens: anthropicDefaultMaxTokens,
+          stream: true,
+          ...(handleAttachFile ? { tools: [anthropicAttachFileTool] } : {})
+        })
+      });
+
+      if (res.status === 429) {
+        const raw = await res.text();
+        throw new RateLimitError("anthropic", model, extractErrorDetail(raw, parseJson(raw)));
+      }
+
+      if (!res.ok) {
+        const raw = await res.text();
+        const payload = parseJson(raw);
+        if (payload?.error?.type === "rate_limit_error") {
+          throw new RateLimitError("anthropic", model, extractErrorDetail(raw, payload));
+        }
+        throw new Error(`Anthropic request failed (model=${model}): ${extractErrorDetail(raw, payload)}`);
+      }
+
+      if (res.body) {
+        roundText = await parseAnthropicSseStream(res.body, loopOnDelta, collector);
+      } else {
+        // Non-streaming fallback: tool loop unsupported here, return text only.
+        const raw = await res.text();
+        const payload = parseJson(raw);
+        if (payload?.stop_reason === "tool_use") {
+          console.warn(
+            `[ai] non-streaming anthropic response has stop_reason=tool_use; discarding tool_use blocks (model=${model})`
+          );
+        }
+        const text = (payload?.content || [])
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("")
+          .trim();
+        if (cumulativeText.length === lenBefore && text) {
+          cumulativeText = cumulativeText
+            ? cumulativeText + (cumulativeText.endsWith("\n") ? "" : "\n") + text
+            : text;
+        }
+        return cumulativeText.trim();
+      }
+    } catch (err) {
+      // From round 2 on, round-1 text/files already reached the connector;
+      // model fallback would corrupt the posted stream (see Codex loop).
+      if (round === 0) {
+        throw err;
+      }
+      console.warn(`[ai] attach_file follow-up round ${round + 1} failed, returning partial text`, err);
+      return cumulativeText.trim();
+    }
+
+    if (cumulativeText.length === lenBefore && roundText) {
+      cumulativeText = cumulativeText
+        ? cumulativeText + (cumulativeText.endsWith("\n") ? "" : "\n") + roundText
+        : roundText;
+    }
+
+    const toolUses = (collector?.blocks || []).filter((b) => b?.type === "tool_use");
+    if (!handleAttachFile || collector?.stopReason !== "tool_use" || toolUses.length === 0) {
+      return cumulativeText.trim();
+    }
+    if (round >= maxToolRounds) {
+      console.warn(`[ai] attach_file tool round limit reached (${maxToolRounds}), stopping loop`);
+      return cumulativeText.trim();
+    }
+
+    // blocks is index-assigned and may be sparse — skip holes explicitly.
+    const assistantContent = [];
+    for (const b of collector.blocks) {
+      if (!b) {
+        continue;
+      }
+      if (b.type === "text" && b.text.trim()) {
+        assistantContent.push({ type: "text", text: b.text });
+      }
+      if (b.type === "tool_use") {
+        assistantContent.push({ type: "tool_use", id: b.id, name: b.name, input: b.input ?? {} });
+      }
+    }
+
+    const toolResults = [];
+    for (const tu of toolUses) {
+      const result = tu.parseError
+        ? { output: "Error: could not parse tool input JSON", isError: true }
+        : tu.name === attachFileToolName
+          ? await handleAttachFile(tu.input)
+          : { output: `Error: unknown tool ${tu.name}`, isError: true };
+      toolResults.push({
+        type: "tool_result",
+        tool_use_id: tu.id,
+        content: result.output,
+        ...(result.isError ? { is_error: true } : {})
+      });
+    }
+
+    messages = [
+      ...messages,
+      { role: "assistant", content: assistantContent },
+      { role: "user", content: toolResults }
+    ];
+    needSeparator = true;
+  }
 }
 
 export async function createAiResponse(context, options = {}) {
@@ -782,6 +1163,7 @@ export async function createAiResponse(context, options = {}) {
   const userOnImage = typeof options.onImage === "function" ? options.onImage : undefined;
   const userOnImageEvent =
     typeof options.onImageEvent === "function" ? options.onImageEvent : undefined;
+  const userOnFile = typeof options.onFile === "function" ? options.onFile : undefined;
 
   const models =
     Array.isArray(options.models) && options.models.length > 0
@@ -794,10 +1176,15 @@ export async function createAiResponse(context, options = {}) {
     throw new Error("at least one model is required for createAiResponse");
   }
 
-  const systemPrompt =
+  const resolvedSystemPrompt =
     typeof options.systemPrompt === "string" && options.systemPrompt.trim()
       ? options.systemPrompt.trim()
       : defaultSystemPrompt;
+  // onFile presence == tool presence == guidance presence (F8): connectors
+  // never manage the guidance themselves.
+  const systemPrompt = userOnFile
+    ? `${resolvedSystemPrompt}\n\n${attachFileGuidance}`
+    : resolvedSystemPrompt;
 
   const emptyRetryCount = Number.isFinite(Number(options.emptyRetryCount))
     ? Math.max(0, Number(options.emptyRetryCount))
@@ -805,6 +1192,13 @@ export async function createAiResponse(context, options = {}) {
 
   let imageCount = 0;
   let imageActivity = false;
+  let fileCount = 0;
+  const wrappedOnFile = userOnFile
+    ? (file) => {
+        fileCount++;
+        return userOnFile(file);
+      }
+    : undefined;
   const wrappedOnImage = (buffer, meta) => {
     imageCount++;
     if (userOnImage) {
@@ -850,16 +1244,20 @@ export async function createAiResponse(context, options = {}) {
     for (let attempt = 0; attempt <= emptyRetryCount; attempt++) {
       imageCount = 0;
       imageActivity = false;
+      fileCount = 0;
       try {
         const result = provider === "anthropic"
-          ? await callAnthropic(model, context, systemPrompt, onDelta)
+          ? await callAnthropic(model, context, systemPrompt, onDelta, {
+              onFile: wrappedOnFile
+            })
           : await callCodex(model, context, systemPrompt, webSearch, onDelta, {
               imageGeneration,
               onImage: wrappedOnImage,
-              onImageEvent
+              onImageEvent,
+              onFile: wrappedOnFile
             });
 
-        if (result || imageCount > 0) {
+        if (result || imageCount > 0 || fileCount > 0) {
           return result || "";
         }
 
@@ -918,5 +1316,9 @@ export function getAiConfig() {
 // Internal helpers exported for unit tests only. Do not consume from production code.
 export const __testing__ = {
   parseCodexSseStream,
-  callCodex
+  callCodex,
+  parseAnthropicSseStream,
+  callAnthropic,
+  sanitizeAttachmentFilename,
+  createAttachFileHandler
 };
