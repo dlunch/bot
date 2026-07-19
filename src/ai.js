@@ -68,7 +68,7 @@ const dangerousAttachmentExtensions = new Set([
 function sanitizeAttachmentFilename(name) {
   const lastSegment = String(name || "").split(/[/\\]/).pop() || "";
   let sanitized = lastSegment
-    .replace(/[^A-Za-z0-9._-]/g, "_")
+    .replace(/[^\p{L}\p{N}._-]/gu, "_")
     .replace(/^\.+/, "")
     .replace(/\.+$/, "");
   if (!sanitized || /^_+$/.test(sanitized)) {

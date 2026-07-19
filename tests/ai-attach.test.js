@@ -503,9 +503,15 @@ test("B1 sanitize: safe filenames pass through unchanged", () => {
   assert.equal(sanitizeAttachmentFilename("My-File_v2.txt"), "My-File_v2.txt");
 });
 
+test("B1 sanitize: Unicode letters and numbers are preserved", () => {
+  assert.equal(sanitizeAttachmentFilename("보고서-한글.md"), "보고서-한글.md");
+  assert.equal(sanitizeAttachmentFilename("日本語-café-١٢٣.txt"), "日本語-café-١٢٣.txt");
+});
+
 test("B1 sanitize: path segments are stripped", () => {
   assert.equal(sanitizeAttachmentFilename("../../etc/passwd"), "passwd");
   assert.equal(sanitizeAttachmentFilename("a/b\\c.txt"), "c.txt");
+  assert.equal(sanitizeAttachmentFilename("../임시/최종-보고서.md"), "최종-보고서.md");
 });
 
 test("B1 sanitize: leading dots removed", () => {
@@ -516,7 +522,11 @@ test("B1 sanitize: leading dots removed", () => {
 test("B1 sanitize: control chars, spaces and mention tokens become underscores", () => {
   const out = sanitizeAttachmentFilename("a b\tc<@U123>.txt");
   assert.equal(out, "a_b_c__U123_.txt");
-  assert.ok(!/[^A-Za-z0-9._-]/.test(out), "only whitelisted chars may remain");
+  assert.ok(!/[^\p{L}\p{N}._-]/u.test(out), "only whitelisted chars may remain");
+  assert.equal(
+    sanitizeAttachmentFilename("보고서 <@U123> <@&R456> @everyone\n😀.md"),
+    "보고서___U123_____R456___everyone__.md"
+  );
 });
 
 test("B1 sanitize: empty/null/dots-only fall back to attachment.txt", () => {
