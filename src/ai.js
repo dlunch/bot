@@ -47,13 +47,16 @@ const maxToolRounds = 5;
 const maxAttachFilenameLength = 80;
 
 const attachFileGuidance =
-  "Answer inline in the message body by default; length alone is never a reason to attach a file. " +
-  "Use attach_file only when the user explicitly asks for a file or download, or when the content " +
-  "is a complete standalone deliverable (such as a runnable full program or a long document or " +
-  "dataset) for which a file is clearly more useful and inline output would seriously harm " +
-  "readability. Do not use attach_file for explanations, analysis, ordinary answers, medium-length " +
-  "code, or multiple small snippets. When uncertain, answer inline. When attaching, use a suitable " +
-  "filename and the COMPLETE content. Before calling attach_file, first write and stream a brief " +
+  "Follow the user's requested output format first: if they explicitly request inline output, " +
+  "answer inline; if they explicitly request a file or download, use attach_file. When the user " +
+  "asks you to create a new code deliverable they can save and use—such as code, a script, a " +
+  "component, a configuration file, or a complete implementation—use attach_file regardless of " +
+  "length whenever the deliverable has a natural filename. For a multi-file project, attach each " +
+  "file separately, prioritizing the core files within the attachment limit. Answer inline for " +
+  "code explanations, code review, debugging explanations, a small patch or diff to existing code, " +
+  "API usage examples, and one- or two-line or other short illustrative snippets. Length alone does " +
+  "not decide whether to attach. When attaching, use a suitable filename and the COMPLETE content. " +
+  "Before calling attach_file, first write and stream a brief " +
   "explanation in the message body so the user gets an immediate response. Never repeat attached " +
   "file content in the body.";
 

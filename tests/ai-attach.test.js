@@ -1100,15 +1100,21 @@ test("B4 createAiResponse: onFile appends attach_file guidance to the system pro
       "guidance must require body text before the tool call"
     );
     assert.ok(
-      bodies[0].instructions.includes("Answer inline in the message body by default") &&
-        bodies[0].instructions.includes("length alone is never a reason") &&
-        bodies[0].instructions.includes("When uncertain, answer inline"),
-      "guidance must make conservative inline output the default"
+      bodies[0].instructions.includes("create a new code deliverable") &&
+        bodies[0].instructions.includes("use attach_file regardless of length") &&
+        bodies[0].instructions.includes("component, a configuration file, or a complete implementation"),
+      "guidance must attach code deliverables intended to be saved and used"
     );
     assert.ok(
-      bodies[0].instructions.includes("user explicitly asks for a file or download") &&
-        bodies[0].instructions.includes("complete standalone deliverable"),
-      "guidance must limit attachments to explicit requests or clearly useful standalone outputs"
+      bodies[0].instructions.includes("code explanations, code review, debugging explanations") &&
+        bodies[0].instructions.includes("API usage examples") &&
+        bodies[0].instructions.includes("short illustrative snippets"),
+      "guidance must keep explanations and illustrative snippets inline"
+    );
+    assert.ok(
+      bodies[0].instructions.includes("if they explicitly request inline output") &&
+        bodies[0].instructions.includes("if they explicitly request a file or download"),
+      "guidance must honor explicit inline and file output requests"
     );
     assert.ok(
       !bodies[0].instructions.includes("30 lines") &&
