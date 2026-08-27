@@ -39,7 +39,7 @@ tolerations: []
 affinity: {}
 
 env:
-  maxThreadHistory: 20
+  maxContextBytes: 200000
   slackStreamUpdateMs: 800
   discordStreamUpdateMs: 800
 

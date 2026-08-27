@@ -10,7 +10,18 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { loadServicesConfig } from "../src/index.js";
+import { loadServicesConfig, parseMaxContextBytes } from "../src/index.js";
+
+test("context byte setting defaults to 200000 and accepts positive safe integers", () => {
+  assert.equal(parseMaxContextBytes(undefined), 200000);
+  assert.equal(parseMaxContextBytes("250000"), 250000);
+});
+
+test("context byte setting rejects invalid values instead of falling back", () => {
+  for (const value of ["", "nope", "0", "-1", "1.5", String(Number.MAX_SAFE_INTEGER + 1)]) {
+    assert.throws(() => parseMaxContextBytes(value), /positive safe integer/);
+  }
+});
 
 async function writeTempServices(payload) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "bot-config-test-"));

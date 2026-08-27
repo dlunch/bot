@@ -1,5 +1,4 @@
 export const maxTextFileChars = 50000;
-export const maxTextFilesInContext = 5;
 
 const textMimeAllowlist = new Set([
   "application/json",

@@ -8,7 +8,15 @@ import { startIrcBot } from "./connectors/irc.js";
 
 const defaultServicesFile = path.join(process.cwd(), "config", "services.json");
 
-const maxThreadHistory = Number(process.env.MAX_THREAD_HISTORY || 20);
+export function parseMaxContextBytes(value) {
+  const parsed = value === undefined ? 200000 : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error("MAX_CONTEXT_BYTES must be a positive safe integer");
+  }
+  return parsed;
+}
+
+const maxContextBytes = parseMaxContextBytes(process.env.MAX_CONTEXT_BYTES);
 const slackStreamUpdateMs = Number(process.env.SLACK_STREAM_UPDATE_MS || 800);
 const discordStreamUpdateMs = Number(process.env.DISCORD_STREAM_UPDATE_MS || 800);
 
@@ -224,7 +232,7 @@ async function main() {
   }
 
   const commonOptions = {
-    maxThreadHistory,
+    maxContextBytes,
     slackStreamUpdateMs,
     discordStreamUpdateMs
   };

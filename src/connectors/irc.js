@@ -2,6 +2,7 @@ import net from "node:net";
 import tls from "node:tls";
 import { Buffer } from "node:buffer";
 import { createAiResponse } from "../ai.js";
+import { collectRecentContext } from "./context.js";
 
 function escapeRegex(value = "") {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -129,8 +130,48 @@ function hasCapability(capabilityList = "", target = "") {
     .some((item) => item === normalizedTarget);
 }
 
+export class IrcConversationHistory {
+  constructor(maxContextBytes) {
+    this.maxContextBytes = maxContextBytes;
+    this.messagesByConversation = new Map();
+  }
+
+  async contextFor(conversationKey, userMessage) {
+    return await collectRecentContext(
+      [...(this.messagesByConversation.get(conversationKey) || []), userMessage].reverse(),
+      this.maxContextBytes,
+      async (message) => message
+    );
+  }
+
+  async commit(conversationKey, userMessage, assistantMessage) {
+    const retained = await collectRecentContext(
+      [
+        ...(this.messagesByConversation.get(conversationKey) || []),
+        userMessage,
+        assistantMessage
+      ].reverse(),
+      this.maxContextBytes,
+      async (message) => message
+    );
+    this.messagesByConversation.set(conversationKey, retained);
+  }
+}
+
+export async function completeIrcTurn(history, conversationKey, userMessage, generateResponse) {
+  const context = await history.contextFor(conversationKey, userMessage);
+  const answer = await generateResponse(context);
+  if (answer) {
+    await history.commit(conversationKey, userMessage, {
+      role: "assistant",
+      content: answer
+    });
+  }
+  return answer;
+}
+
 export async function startIrcBot(config, options) {
-  const { maxThreadHistory } = options;
+  const { maxContextBytes } = options;
   const host = config.server;
   const useTls = Boolean(config.ssl || config.tls);
   const port = Number(config.port || (useTls ? 6697 : 6667));
@@ -146,7 +187,7 @@ export async function startIrcBot(config, options) {
   const saslPassword = config.sasl?.password || "";
   let currentNick = requestedNick;
 
-  const historyByConversation = new Map();
+  const conversationHistory = new IrcConversationHistory(maxContextBytes);
   const queueByConversation = new Map();
 
   let socket = null;
@@ -228,21 +269,6 @@ export async function startIrcBot(config, options) {
     }
   }
 
-  function appendHistory(key, message) {
-    const history = historyByConversation.get(key) || [];
-    history.push(message);
-
-    if (history.length > maxThreadHistory) {
-      history.splice(0, history.length - maxThreadHistory);
-    }
-
-    historyByConversation.set(key, history);
-  }
-
-  function getHistory(key) {
-    return [...(historyByConversation.get(key) || [])];
-  }
-
   function enqueueConversation(key, task) {
     const previous = queueByConversation.get(key) || Promise.resolve();
     const next = previous.catch(() => undefined).then(task);
@@ -287,15 +313,20 @@ export async function startIrcBot(config, options) {
 
     void enqueueConversation(conversationKey, async () => {
       const userContent = isDirect ? cleanedText : `${senderNick}: ${cleanedText}`;
-      const context = [...getHistory(conversationKey), { role: "user", content: userContent }];
+      const userMessage = { role: "user", content: userContent };
 
       try {
-        const rawAnswer = await createAiResponse(context, {
-          models: config.models,
-          providers: config.providers,
-          webSearch: config.webSearch,
-          systemPrompt: config.systemPrompt
-        });
+        const rawAnswer = await completeIrcTurn(
+          conversationHistory,
+          conversationKey,
+          userMessage,
+          (context) => createAiResponse(context, {
+            models: config.models,
+            providers: config.providers,
+            webSearch: config.webSearch,
+            systemPrompt: config.systemPrompt
+          })
+        );
 
         if (!rawAnswer) {
           const modelList = (config.models || []).join(", ") || "(none)";
@@ -309,8 +340,6 @@ export async function startIrcBot(config, options) {
           return;
         }
 
-        appendHistory(conversationKey, { role: "user", content: userContent });
-        appendHistory(conversationKey, { role: "assistant", content: rawAnswer });
         sendMessage(replyTarget, rawAnswer);
       } catch (error) {
         console.error(`[irc][message] error name=${config.name} target=${replyTarget}`, error);

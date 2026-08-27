@@ -50,8 +50,8 @@ spec:
                   optional: true
             - name: CODEX_REFRESH_TOKEN_FILE
               value: {{ .Values.auth.codex.refreshTokenFile | quote }}
-            - name: MAX_THREAD_HISTORY
-              value: {{ .Values.env.maxThreadHistory | quote }}
+            - name: MAX_CONTEXT_BYTES
+              value: {{ .Values.env.maxContextBytes | quote }}
             - name: SLACK_STREAM_UPDATE_MS
               value: {{ .Values.env.slackStreamUpdateMs | quote }}
             - name: DISCORD_STREAM_UPDATE_MS

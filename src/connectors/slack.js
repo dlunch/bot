@@ -1,6 +1,7 @@
 import SlackBolt from "@slack/bolt";
 import { createAiResponse } from "../ai.js";
-import { isTextLike, fetchTextAttachmentBlock, maxTextFilesInContext } from "./attachments.js";
+import { isTextLike, fetchTextAttachmentBlock } from "./attachments.js";
+import { attachImagesToLastUser, collectRecentContext } from "./context.js";
 import { markdownChunk } from "./markdown-chunks.js";
 
 const { App, SocketModeReceiver } = SlackBolt;
@@ -158,8 +159,216 @@ export async function deliverSlackFiles(client, files, ctx = {}) {
   }
 }
 
+export async function* collectSlackDirectCandidates(event, loadPage, onError = console.error) {
+  yield event;
+  const seen = new Set([event.ts]);
+  const cursors = new Set();
+  let cursor;
+  while (true) {
+    let page;
+    try {
+      page = await loadPage({
+        channel: event.channel,
+        limit: 200,
+        latest: event.ts,
+        inclusive: true,
+        cursor
+      });
+    } catch (error) {
+      onError("[slack][dm_context] history load failed", error);
+      return;
+    }
+
+    const pageMessages = [...(page.messages || [])].sort(
+      (a, b) => Number(b.ts) - Number(a.ts)
+    );
+    for (const message of pageMessages) {
+      if (seen.has(message.ts) || Number(message.ts) > Number(event.ts)) {
+        continue;
+      }
+      seen.add(message.ts);
+      yield message;
+    }
+
+    const nextCursor = page.response_metadata?.next_cursor?.trim();
+    if (!nextCursor || cursors.has(nextCursor)) {
+      return;
+    }
+    cursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+}
+
+export async function collectSlackThreadCandidates(event, loadPage) {
+  const repliesByTimestamp = new Map([[event.ts, event]]);
+  const cursors = new Set();
+  let cursor;
+  while (true) {
+    const page = await loadPage({
+      channel: event.channel,
+      ts: event.thread_ts || event.ts,
+      limit: 200,
+      latest: event.ts,
+      inclusive: true,
+      cursor
+    });
+    for (const message of page.messages || []) {
+      if (message.ts !== event.ts && Number(message.ts) <= Number(event.ts)) {
+        repliesByTimestamp.set(message.ts, message);
+      }
+    }
+
+    const nextCursor = page.response_metadata?.next_cursor?.trim();
+    if (!nextCursor || cursors.has(nextCursor)) {
+      break;
+    }
+    cursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+
+  return [...repliesByTimestamp.values()].sort(
+    (a, b) => Number(b.ts) - Number(a.ts)
+  );
+}
+
+function isDirectMessage(event) {
+  return event.channel_type === "im";
+}
+
+function hasSlackImageFile(message) {
+  return Array.isArray(message?.files) && message.files.some(
+    (file) => typeof file?.mimetype === "string" && file.mimetype.startsWith("image/")
+  );
+}
+
+function isSlackTextFile(file) {
+  if (typeof file?.mimetype === "string" && file.mimetype.startsWith("image/")) {
+    return false;
+  }
+  return isTextLike(file?.name, file?.mimetype);
+}
+
+export async function materializeSlackMessage(message, botUserId, botToken) {
+  if (
+    message.subtype &&
+    !["bot_message", "file_share", "thread_broadcast"].includes(message.subtype)
+  ) {
+    return null;
+  }
+
+  const content = (message.text || "")
+    .replace(/<@[^>]+>/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const blocks = [];
+  for (const file of message.files || []) {
+    if (!isSlackTextFile(file)) {
+      continue;
+    }
+    const block = await fetchTextAttachmentBlock({
+      url: file?.url_private_download || file?.url_private,
+      name: file?.name,
+      headers: { Authorization: `Bearer ${botToken}` }
+    });
+    if (block) {
+      blocks.push(block);
+    }
+  }
+
+  const finalContent = [content, ...blocks].filter(Boolean).join("\n\n");
+  if (!finalContent && !hasSlackImageFile(message)) {
+    return null;
+  }
+  return {
+    source: message,
+    role: (botUserId && message.user === botUserId) || message.bot_id ? "assistant" : "user",
+    content: finalContent
+  };
+}
+
+async function fetchSlackImageAsDataUrl(file, botToken) {
+  const maxImageBytes = 5 * 1024 * 1024;
+  const fileUrl = file?.url_private_download || file?.url_private;
+  if (
+    !fileUrl ||
+    typeof file?.mimetype !== "string" ||
+    !file.mimetype.startsWith("image/")
+  ) {
+    return null;
+  }
+  try {
+    const response = await fetch(fileUrl, {
+      headers: { Authorization: `Bearer ${botToken}` }
+    });
+    if (!response.ok) {
+      console.warn(`[slack][image_fetch] http ${response.status} file=${file.id}`);
+      return null;
+    }
+    const bytes = await response.arrayBuffer();
+    if (bytes.byteLength > maxImageBytes) {
+      console.warn(`[slack][image_fetch] skipping large file id=${file.id} bytes=${bytes.byteLength}`);
+      return null;
+    }
+    return `data:${file.mimetype};base64,${Buffer.from(bytes).toString("base64")}`;
+  } catch (error) {
+    console.warn(`[slack][image_fetch] failed id=${file?.id}`, error);
+    return null;
+  }
+}
+
+export async function buildSlackContext(client, event, options) {
+  const { botUserId, botToken, maxContextBytes, withRetry } = options;
+  if (isDirectMessage(event) && !event.thread_ts) {
+    const selected = await collectRecentContext(
+      collectSlackDirectCandidates(
+        event,
+        (params) => withRetry(
+          () => client.conversations.history(params),
+          "conversations_history"
+        )
+      ),
+      maxContextBytes,
+      (message) => materializeSlackMessage(message, botUserId, botToken)
+    );
+    const context = selected.map(({ role, content }) => ({ role, content }));
+    return await attachImagesToLastUser(
+      context,
+      selected.map(({ source }) => source),
+      (message) => message?.files || [],
+      (file) => fetchSlackImageAsDataUrl(file, botToken)
+    );
+  }
+
+  let messages;
+  try {
+    messages = await collectSlackThreadCandidates(
+      event,
+      (params) => withRetry(
+        () => client.conversations.replies(params),
+        "conversations_replies"
+      )
+    );
+  } catch (error) {
+    console.error("[slack][thread_context] history load failed, fallback to current message", error);
+    messages = [event];
+  }
+
+  const selected = await collectRecentContext(
+    messages,
+    maxContextBytes,
+    (message) => materializeSlackMessage(message, botUserId, botToken)
+  );
+  const context = selected.map(({ role, content }) => ({ role, content }));
+  return await attachImagesToLastUser(
+    context,
+    selected.map(({ source }) => source),
+    (message) => message?.files || [],
+    (file) => fetchSlackImageAsDataUrl(file, botToken)
+  );
+}
+
 export async function startSlackBot(config, options) {
-  const { maxThreadHistory, slackStreamUpdateMs } = options;
+  const { maxContextBytes, slackStreamUpdateMs } = options;
   const receiver = new SocketModeReceiver({
     appToken: config.appToken
   });
@@ -182,13 +391,6 @@ export async function startSlackBot(config, options) {
 
   let botUserId = null;
 
-  function cleanSlackText(text = "") {
-    return text
-      .replace(/<@[^>]+>/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
   function isFromBot(event) {
     return (
       event.subtype === "bot_message" ||
@@ -199,10 +401,6 @@ export async function startSlackBot(config, options) {
 
   function isMentioningBot(text = "") {
     return Boolean(botUserId && text.includes(`<@${botUserId}>`));
-  }
-
-  function isDirectMessage(event) {
-    return event.channel_type === "im";
   }
 
   const slackMaxLength = 20000;
@@ -262,233 +460,6 @@ export async function startSlackBot(config, options) {
     }
   }
 
-  const maxImagesInContext = 3;
-  const maxImageBytes = 5 * 1024 * 1024;
-
-  function hasImageFile(message) {
-    return Array.isArray(message?.files) && message.files.some(
-      (file) => typeof file?.mimetype === "string" && file.mimetype.startsWith("image/")
-    );
-  }
-
-  function isSlackTextFile(file) {
-    if (typeof file?.mimetype === "string" && file.mimetype.startsWith("image/")) {
-      return false;
-    }
-    return isTextLike(file?.name, file?.mimetype);
-  }
-
-  function hasTextFile(message) {
-    return Array.isArray(message?.files) && message.files.some(isSlackTextFile);
-  }
-
-  async function enrichContextWithTextFiles(context, messages) {
-    // Text attachments carry no role restriction (unlike images), so inline
-    // them into the message they belong to. Walk newest-first so the budget
-    // favors the most recent files when a thread has many.
-    let budget = maxTextFilesInContext;
-    for (let i = messages.length - 1; i >= 0 && budget > 0; i--) {
-      const files = messages[i]?.files;
-      if (!Array.isArray(files) || !files.length) {
-        continue;
-      }
-      const blocks = [];
-      for (const file of files) {
-        if (budget <= 0) {
-          break;
-        }
-        if (!isSlackTextFile(file)) {
-          continue;
-        }
-        const block = await fetchTextAttachmentBlock({
-          url: file?.url_private_download || file?.url_private,
-          name: file?.name,
-          headers: { Authorization: `Bearer ${config.botToken}` }
-        });
-        if (block) {
-          blocks.push(block);
-          budget--;
-        }
-      }
-      if (blocks.length) {
-        const existing = typeof context[i].content === "string" ? context[i].content : "";
-        context[i] = {
-          ...context[i],
-          content: [existing, ...blocks].filter(Boolean).join("\n\n")
-        };
-      }
-    }
-  }
-
-  async function fetchSlackImageAsDataUrl(file) {
-    const url = file?.url_private_download || file?.url_private;
-    if (!url || typeof file?.mimetype !== "string" || !file.mimetype.startsWith("image/")) {
-      return null;
-    }
-    try {
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${config.botToken}` }
-      });
-      if (!res.ok) {
-        console.warn(`[slack][image_fetch] http ${res.status} file=${file.id}`);
-        return null;
-      }
-      const ab = await res.arrayBuffer();
-      if (ab.byteLength > maxImageBytes) {
-        console.warn(`[slack][image_fetch] skipping large file id=${file.id} bytes=${ab.byteLength}`);
-        return null;
-      }
-      const base64 = Buffer.from(ab).toString("base64");
-      return `data:${file.mimetype};base64,${base64}`;
-    } catch (err) {
-      console.warn(`[slack][image_fetch] failed id=${file?.id}`, err);
-      return null;
-    }
-  }
-
-  async function enrichContextWithImages(context, messages) {
-    // Collect the most-recent N images from thread history and attach them ALL
-    // to the last user turn (which is the current request). This lets the model
-    // "see" the bot's prior generations for edit follow-ups ("make it orange")
-    // without needing input_image on assistant-role messages, which the API
-    // does not accept. Oldest-to-newest preserves conversation reference order.
-    const collected = [];
-    let budget = maxImagesInContext;
-    for (let i = messages.length - 1; i >= 0 && budget > 0; i--) {
-      const files = messages[i]?.files;
-      if (!Array.isArray(files) || !files.length) {
-        continue;
-      }
-      for (const file of files) {
-        if (budget <= 0) {
-          break;
-        }
-        const dataUrl = await fetchSlackImageAsDataUrl(file);
-        if (dataUrl) {
-          collected.unshift(dataUrl);
-          budget--;
-        }
-      }
-    }
-
-    if (collected.length === 0) {
-      return context;
-    }
-
-    let lastUserIdx = -1;
-    for (let i = context.length - 1; i >= 0; i--) {
-      if (context[i].role === "user") {
-        lastUserIdx = i;
-        break;
-      }
-    }
-    if (lastUserIdx === -1) {
-      return context;
-    }
-
-    const enriched = [...context];
-    const lastText = context[lastUserIdx].content;
-    const parts = [];
-    if (typeof lastText === "string" && lastText.trim()) {
-      parts.push({ type: "input_text", text: lastText });
-    }
-    for (const url of collected) {
-      parts.push({ type: "input_image", image_url: url });
-    }
-    enriched[lastUserIdx] = { role: "user", content: parts };
-    return enriched;
-  }
-
-  async function buildThreadContext(client, event) {
-    if (isDirectMessage(event) && !event.thread_ts) {
-      try {
-        const history = await withSlackRetry(() => client.conversations.history({
-          channel: event.channel,
-          limit: maxThreadHistory
-        }), "conversations_history");
-
-        const messages = [...(history.messages || [])].reverse();
-        const keptMessages = [];
-        const context = [];
-
-        for (const message of messages) {
-          if (message.subtype && message.subtype !== "bot_message") {
-            continue;
-          }
-
-          const text = cleanSlackText(message.text);
-          if (!text && !hasImageFile(message) && !hasTextFile(message)) {
-            continue;
-          }
-
-          const isAssistant =
-            (botUserId && message.user === botUserId) || Boolean(message.bot_id);
-
-          keptMessages.push(message);
-          context.push({
-            role: isAssistant ? "assistant" : "user",
-            content: text
-          });
-        }
-
-        await enrichContextWithTextFiles(context, keptMessages);
-        return await enrichContextWithImages(context, keptMessages);
-      } catch (error) {
-        console.error("[slack][dm_context] history load failed, fallback to current message", error);
-        const fallbackText = cleanSlackText(event.text || "");
-        return fallbackText ? [{ role: "user", content: fallbackText }] : [];
-      }
-    }
-
-    const threadTs = event.thread_ts || event.ts;
-    // conversations.replies returns messages oldest-first and `limit` truncates
-    // from the BEGINNING of the thread, not the end. For long threads that
-    // means we'd capture the start of the conversation instead of the recent
-    // context near the mention. Paginate forward to the end and then keep the
-    // last maxThreadHistory messages.
-    const allReplies = [];
-    let cursor;
-    const pageSize = 200;
-    const hardCap = Math.max(maxThreadHistory * 5, pageSize * 5);
-    do {
-      const page = await withSlackRetry(() => client.conversations.replies({
-        channel: event.channel,
-        ts: threadTs,
-        limit: pageSize,
-        cursor
-      }), "conversations_replies");
-      const pageMessages = page.messages || [];
-      allReplies.push(...pageMessages);
-      cursor = page.has_more ? page.response_metadata?.next_cursor : undefined;
-    } while (cursor && allReplies.length < hardCap);
-
-    const messages =
-      allReplies.length > maxThreadHistory
-        ? allReplies.slice(-maxThreadHistory)
-        : allReplies;
-    const keptMessages = [];
-    const context = [];
-
-    for (const message of messages) {
-      const text = cleanSlackText(message.text);
-      if (!text && !hasImageFile(message) && !hasTextFile(message)) {
-        continue;
-      }
-
-      const isAssistant =
-        (botUserId && message.user === botUserId) || Boolean(message.bot_id);
-
-      keptMessages.push(message);
-      context.push({
-        role: isAssistant ? "assistant" : "user",
-        content: text
-      });
-    }
-
-    await enrichContextWithTextFiles(context, keptMessages);
-    return await enrichContextWithImages(context, keptMessages);
-  }
-
   async function hasBotReplyInThread(client, event) {
     if (!event.thread_ts) {
       return false;
@@ -497,7 +468,9 @@ export async function startSlackBot(config, options) {
     const replies = await withSlackRetry(() => client.conversations.replies({
       channel: event.channel,
       ts: event.thread_ts,
-      limit: maxThreadHistory
+      limit: 200,
+      latest: event.ts,
+      inclusive: true
     }), "thread_replies");
 
     return (replies.messages || []).some(
@@ -534,7 +507,12 @@ export async function startSlackBot(config, options) {
         console.error("[slack][reaction_add] skipped", error?.data || error);
       }
 
-      const context = await buildThreadContext(client, event);
+      const context = await buildSlackContext(client, event, {
+        botUserId,
+        botToken: config.botToken,
+        maxContextBytes,
+        withRetry: withSlackRetry
+      });
       const lastUserMessage = [...context].reverse().find((msg) => msg.role === "user");
 
       if (!lastUserMessage) {
@@ -782,8 +760,7 @@ export async function startSlackBot(config, options) {
       // Image delivery (M-5 + §6.2 E8): if we collected images during the
       // stream, post them AFTER the text reply has been synced. If there was
       // no text at all, post a small placeholder message first so the thread
-      // history still contains an assistant turn for the next round of
-      // buildThreadContext to pick up.
+      // history still contains an assistant turn for the next context build.
       if (collectedFiles.length > 0 || collectedImages.length > 0) {
         // In channels (and in thread replies), always anchor to the thread so
         // the placeholder + image attachments stay grouped with the original

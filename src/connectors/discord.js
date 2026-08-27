@@ -1,6 +1,7 @@
 import { AttachmentBuilder, Client, EmbedBuilder, GatewayIntentBits, Partials } from "discord.js";
 import { createAiResponse } from "../ai.js";
-import { isTextLike, fetchTextAttachmentBlock, maxTextFilesInContext } from "./attachments.js";
+import { isTextLike, fetchTextAttachmentBlock } from "./attachments.js";
+import { attachImagesToLastUser, collectRecentContext } from "./context.js";
 import { markdownChunk } from "./markdown-chunks.js";
 
 /**
@@ -135,8 +136,252 @@ export async function deliverDiscordFiles(message, { files } = {}) {
   }
 }
 
+async function scanDiscordBotChunks(seedMessage, botUserId, cutoffTimestamp) {
+  const result = [];
+  let lastId = seedMessage.id;
+  let cursor = seedMessage.id;
+  while (true) {
+    let fetched;
+    try {
+      fetched = await seedMessage.channel.messages.fetch({ after: cursor, limit: 100 });
+    } catch (error) {
+      console.warn(`[discord][reply_chain] forward fetch failed id=${seedMessage.id}`, error);
+      break;
+    }
+
+    const page = [...fetched.values()].sort(
+      (a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0)
+    );
+    let reachedCutoff = false;
+    for (const message of page) {
+      if ((message.createdTimestamp || 0) >= cutoffTimestamp) {
+        reachedCutoff = true;
+        break;
+      }
+      if (
+        message.author?.id === botUserId &&
+        message?.reference?.messageId === lastId
+      ) {
+        result.push(message);
+        lastId = message.id;
+      }
+    }
+
+    const nextCursor = page.at(-1)?.id;
+    if (reachedCutoff || page.length < 100 || !nextCursor || nextCursor === cursor) {
+      break;
+    }
+    cursor = nextCursor;
+  }
+  return result;
+}
+
+export async function* collectDiscordReplyCandidates(message, botUserId) {
+  yield message;
+  const seen = new Set([message.id]);
+  let current = message;
+  while (true) {
+    const refId = current?.reference?.messageId;
+    if (!refId || seen.has(refId)) {
+      break;
+    }
+    let parent;
+    try {
+      parent = await current.channel.messages.fetch(refId);
+    } catch (error) {
+      console.warn(`[discord][reply_chain] fetch failed id=${refId}`, error);
+      break;
+    }
+
+    if (parent.author?.id === botUserId) {
+      const forwardChunks = await scanDiscordBotChunks(
+        parent,
+        botUserId,
+        current.createdTimestamp || Number.POSITIVE_INFINITY
+      );
+      for (let index = forwardChunks.length - 1; index >= 0; index--) {
+        const chunk = forwardChunks[index];
+        if (!seen.has(chunk.id)) {
+          seen.add(chunk.id);
+          yield chunk;
+        }
+      }
+    }
+
+    if (!seen.has(parent.id)) {
+      seen.add(parent.id);
+      yield parent;
+    }
+    current = parent;
+  }
+}
+
+export async function* collectDiscordChannelCandidates(message) {
+  yield message;
+  const seen = new Set([message.id]);
+  const snapshotTimestamp = message.createdTimestamp || Number.POSITIVE_INFINITY;
+  let cursor = message.id;
+
+  while (true) {
+    let fetched;
+    try {
+      fetched = await message.channel.messages.fetch({ limit: 100, before: cursor });
+    } catch (error) {
+      console.warn("[discord][context] history fetch failed", error);
+      return;
+    }
+    const page = [...fetched.values()].sort(
+      (a, b) => (b.createdTimestamp || 0) - (a.createdTimestamp || 0)
+    );
+    for (const candidate of page) {
+      if (
+        seen.has(candidate.id) ||
+        (candidate.createdTimestamp || 0) > snapshotTimestamp
+      ) {
+        continue;
+      }
+      seen.add(candidate.id);
+      yield candidate;
+    }
+
+    const nextCursor = page.at(-1)?.id;
+    if (page.length < 100 || !nextCursor || nextCursor === cursor) {
+      break;
+    }
+    cursor = nextCursor;
+  }
+
+  if (typeof message.channel?.isThread === "function" && message.channel.isThread()) {
+    try {
+      const starter = await message.channel.fetchStarterMessage?.();
+      if (
+        starter &&
+        !seen.has(starter.id) &&
+        (starter.createdTimestamp || 0) <= snapshotTimestamp
+      ) {
+        yield starter;
+      }
+    } catch {
+      // Deleted and standalone threads have no accessible starter.
+    }
+  }
+}
+
+function hasDiscordImageAttachment(message) {
+  for (const attachment of message?.attachments?.values?.() || []) {
+    if (
+      typeof attachment?.contentType === "string" &&
+      attachment.contentType.startsWith("image/")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function materializeDiscordMessage(message, botUserId) {
+  if (message.author?.bot && message.author.id !== botUserId) {
+    return null;
+  }
+
+  const baseText = (message.content || "")
+    .replace(new RegExp(`<@!?${botUserId}>`, "g"), "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const embedTexts = [];
+  for (const embed of message.embeds || []) {
+    if (embed?.title) embedTexts.push(embed.title);
+    if (embed?.description) embedTexts.push(embed.description);
+  }
+
+  const content = [baseText, ...embedTexts].filter(Boolean).join("\n").trim();
+  const blocks = [];
+  for (const attachment of message?.attachments?.values?.() || []) {
+    if (
+      typeof attachment?.contentType === "string" &&
+      attachment.contentType.startsWith("image/")
+    ) {
+      continue;
+    }
+    if (!isTextLike(attachment?.name, attachment?.contentType)) {
+      continue;
+    }
+    const block = await fetchTextAttachmentBlock({
+      url: attachment?.url,
+      name: attachment?.name
+    });
+    if (block) {
+      blocks.push(block);
+    }
+  }
+
+  const finalContent = [content, ...blocks].filter(Boolean).join("\n\n");
+  if (!finalContent && !hasDiscordImageAttachment(message)) {
+    return null;
+  }
+  return {
+    source: message,
+    role: message.author?.id === botUserId ? "assistant" : "user",
+    content: finalContent
+  };
+}
+
+async function fetchDiscordImageAsDataUrl(attachment) {
+  const maxImageBytes = 5 * 1024 * 1024;
+  const contentType = attachment?.contentType;
+  const attachmentUrl = attachment?.url;
+  if (
+    !attachmentUrl ||
+    typeof contentType !== "string" ||
+    !contentType.startsWith("image/")
+  ) {
+    return null;
+  }
+  try {
+    const response = await fetch(attachmentUrl);
+    if (!response.ok) {
+      console.warn(`[discord][image_fetch] http ${response.status} id=${attachment.id}`);
+      return null;
+    }
+    const bytes = await response.arrayBuffer();
+    if (bytes.byteLength > maxImageBytes) {
+      console.warn(
+        `[discord][image_fetch] skipping large attachment id=${attachment.id} bytes=${bytes.byteLength}`
+      );
+      return null;
+    }
+    return `data:${contentType};base64,${Buffer.from(bytes).toString("base64")}`;
+  } catch (error) {
+    console.warn(`[discord][image_fetch] failed id=${attachment?.id}`, error);
+    return null;
+  }
+}
+
+export async function buildDiscordContext(message, botUserId, maxContextBytes) {
+  const useReplyChain =
+    typeof message.channel?.isThread === "function" &&
+    !message.channel.isThread() &&
+    message.channel.type !== 1;
+  const candidates = useReplyChain
+    ? collectDiscordReplyCandidates(message, botUserId)
+    : collectDiscordChannelCandidates(message);
+  const selected = await collectRecentContext(
+    candidates,
+    maxContextBytes,
+    (candidate) => materializeDiscordMessage(candidate, botUserId)
+  );
+  const context = selected.map(({ role, content }) => ({ role, content }));
+
+  return await attachImagesToLastUser(
+    context,
+    selected.map(({ source }) => source),
+    (source) => source?.attachments?.values?.() || [],
+    fetchDiscordImageAsDataUrl
+  );
+}
+
 export async function startDiscordBot(config, options) {
-  const { maxThreadHistory, discordStreamUpdateMs } = options;
+  const { maxContextBytes, discordStreamUpdateMs } = options;
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
@@ -146,336 +391,6 @@ export async function startDiscordBot(config, options) {
     ],
     partials: [Partials.Channel]
   });
-
-  function cleanDiscordText(text = "", botUserId) {
-    return text.replace(new RegExp(`<@!?${botUserId}>`, "g"), "").replace(/\s+/g, " ").trim();
-  }
-
-  const maxImagesInContext = 3;
-  const maxImageBytes = 5 * 1024 * 1024;
-
-  function hasImageAttachment(msg) {
-    const attachments = msg?.attachments;
-    if (!attachments || attachments.size === 0) {
-      return false;
-    }
-    for (const attachment of attachments.values()) {
-      if (typeof attachment?.contentType === "string" && attachment.contentType.startsWith("image/")) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function hasTextAttachment(msg) {
-    const attachments = msg?.attachments;
-    if (!attachments || attachments.size === 0) {
-      return false;
-    }
-    for (const attachment of attachments.values()) {
-      if (
-        typeof attachment?.contentType !== "string" ||
-        !attachment.contentType.startsWith("image/")
-      ) {
-        if (isTextLike(attachment?.name, attachment?.contentType)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  async function enrichContextWithTextFiles(context, keptMessages) {
-    // Text attachments carry no role restriction (unlike images), so inline
-    // them into the message they belong to. Walk newest-first so the budget
-    // favors the most recent files when a thread has many.
-    let budget = maxTextFilesInContext;
-    for (let i = keptMessages.length - 1; i >= 0 && budget > 0; i--) {
-      const attachments = keptMessages[i]?.attachments;
-      if (!attachments || attachments.size === 0) {
-        continue;
-      }
-      const blocks = [];
-      for (const attachment of attachments.values()) {
-        if (budget <= 0) {
-          break;
-        }
-        if (
-          typeof attachment?.contentType === "string" &&
-          attachment.contentType.startsWith("image/")
-        ) {
-          continue;
-        }
-        if (!isTextLike(attachment?.name, attachment?.contentType)) {
-          continue;
-        }
-        const block = await fetchTextAttachmentBlock({
-          url: attachment?.url,
-          name: attachment?.name
-        });
-        if (block) {
-          blocks.push(block);
-          budget--;
-        }
-      }
-      if (blocks.length) {
-        const existing = typeof context[i].content === "string" ? context[i].content : "";
-        context[i] = {
-          ...context[i],
-          content: [existing, ...blocks].filter(Boolean).join("\n\n")
-        };
-      }
-    }
-  }
-
-  async function fetchDiscordImageAsDataUrl(attachment) {
-    const contentType = attachment?.contentType;
-    const url = attachment?.url;
-    if (!url || typeof contentType !== "string" || !contentType.startsWith("image/")) {
-      return null;
-    }
-    try {
-      const res = await fetch(url);
-      if (!res.ok) {
-        console.warn(`[discord][image_fetch] http ${res.status} id=${attachment.id}`);
-        return null;
-      }
-      const ab = await res.arrayBuffer();
-      if (ab.byteLength > maxImageBytes) {
-        console.warn(`[discord][image_fetch] skipping large attachment id=${attachment.id} bytes=${ab.byteLength}`);
-        return null;
-      }
-      const base64 = Buffer.from(ab).toString("base64");
-      return `data:${contentType};base64,${base64}`;
-    } catch (err) {
-      console.warn(`[discord][image_fetch] failed id=${attachment?.id}`, err);
-      return null;
-    }
-  }
-
-  async function walkBotChunkForward(seedMessage, botUserId, maxLength) {
-    // A long bot answer is split into multiple Discord messages (2000-char
-    // cap). Each subsequent chunk replies to its predecessor, so given a bot
-    // message we can walk forward in the channel to recover the rest.
-    if (maxLength <= 0) {
-      return [];
-    }
-    let fetched;
-    try {
-      fetched = await seedMessage.channel.messages.fetch({
-        after: seedMessage.id,
-        limit: Math.min(50, Math.max(maxLength * 2, 10))
-      });
-    } catch (err) {
-      console.warn(`[discord][reply_chain] forward fetch failed id=${seedMessage.id}`, err);
-      return [];
-    }
-    const sorted = [...fetched.values()].sort(
-      (a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0)
-    );
-    const result = [];
-    let lastId = seedMessage.id;
-    for (const msg of sorted) {
-      if (result.length >= maxLength) {
-        break;
-      }
-      if (msg.author?.id !== botUserId) {
-        continue;
-      }
-      if (msg?.reference?.messageId !== lastId) {
-        continue;
-      }
-      result.push(msg);
-      lastId = msg.id;
-    }
-    return result;
-  }
-
-  async function walkReplyChain(message, maxLength, botUserId) {
-    // Walk backward from `message` following message.reference.messageId until
-    // we run out of refs, the parent fetch fails, or we hit maxLength. Returns
-    // chain in oldest-first order. For each bot message in the chain, also
-    // pull in any forward chunks (long-answer continuations) so replying to
-    // any single chunk still surfaces the rest.
-    const chain = [message];
-    let current = message;
-    while (chain.length < maxLength) {
-      const refId = current?.reference?.messageId;
-      if (!refId) {
-        break;
-      }
-      try {
-        const parent = await current.channel.messages.fetch(refId);
-        chain.push(parent);
-        current = parent;
-      } catch (err) {
-        console.warn(`[discord][reply_chain] fetch failed id=${refId}`, err);
-        break;
-      }
-    }
-    chain.reverse();
-
-    // Reserve the backward chain in full and only spend the leftover budget on
-    // forward chunks. Otherwise older bot continuations could push out the
-    // newest user turn (the triggering request), which always sits at the tail
-    // of `chain`.
-    let forwardBudget = Math.max(0, maxLength - chain.length);
-    const seen = new Set(chain.map((m) => m.id));
-    const result = [];
-    for (let i = 0; i < chain.length; i++) {
-      const msg = chain[i];
-      result.push(msg);
-      if (forwardBudget <= 0 || msg.author?.id !== botUserId) {
-        continue;
-      }
-      // If the next chain message is already a continuation of this bot
-      // message, its successors will be picked up from there — no need to
-      // refetch and risk extra rate-limit pressure.
-      const next = chain[i + 1];
-      if (
-        next &&
-        next.author?.id === botUserId &&
-        next?.reference?.messageId === msg.id
-      ) {
-        continue;
-      }
-      const forwardChunks = await walkBotChunkForward(msg, botUserId, forwardBudget);
-      for (const fwd of forwardChunks) {
-        if (seen.has(fwd.id)) {
-          continue;
-        }
-        // Only include chunks that occurred before the next message in the
-        // backward chain to preserve chronological ordering. Forward chunks
-        // are already sorted ascending by timestamp (walkBotChunkForward),
-        // so we can break early once we pass the cutoff.
-        if (next && (fwd.createdTimestamp || 0) >= (next.createdTimestamp || 0)) {
-          break;
-        }
-        seen.add(fwd.id);
-        result.push(fwd);
-        forwardBudget--;
-        if (forwardBudget <= 0) {
-          break;
-        }
-      }
-    }
-    return result;
-  }
-
-  async function buildContext(message, botUserId) {
-    // Discord text channels mix unrelated conversations, so for non-thread,
-    // non-DM channels we follow the reply chain instead of pulling the channel's
-    // recent messages. Threads and DMs are isolated to a single conversation,
-    // so the channel-wide fetch is fine there.
-    const useReplyChain =
-      typeof message.channel?.isThread === "function" &&
-      !message.channel.isThread() &&
-      message.channel.type !== 1; // ChannelType.DM === 1
-
-    let messages;
-    if (useReplyChain) {
-      messages = await walkReplyChain(message, maxThreadHistory, botUserId);
-    } else {
-      const fetched = await message.channel.messages.fetch({ limit: maxThreadHistory });
-      messages = [...fetched.values()].reverse();
-      // A thread started from a message keeps that message as its STARTER, which
-      // lives in the parent channel and is absent from the thread fetch above.
-      // Prepend it so the topic that framed the thread stays in context.
-      if (typeof message.channel?.isThread === "function" && message.channel.isThread()) {
-        try {
-          const starter = await message.channel.fetchStarterMessage?.();
-          if (starter && !messages.some((m) => m.id === starter.id)) {
-            messages.unshift(starter);
-          }
-        } catch {
-          // No starter (deleted, or standalone/forum thread) — nothing to add.
-        }
-      }
-    }
-    const keptMessages = [];
-    const context = [];
-
-    for (const msg of messages) {
-      if (msg.author?.bot && msg.author.id !== botUserId) {
-        continue;
-      }
-
-      const baseText = cleanDiscordText(msg.content || "", botUserId);
-      // Pull text out of any embeds (title + description). The bot itself
-      // sometimes posts long revised_prompts as embed.description when they
-      // exceed the 2000-char content limit, so without this the next turn's
-      // context would lose what was generated last time.
-      const embedTexts = [];
-      for (const embed of msg.embeds || []) {
-        if (embed?.title) embedTexts.push(embed.title);
-        if (embed?.description) embedTexts.push(embed.description);
-      }
-      const text = [baseText, ...embedTexts].filter(Boolean).join("\n").trim();
-      if (!text && !hasImageAttachment(msg) && !hasTextAttachment(msg)) {
-        continue;
-      }
-
-      keptMessages.push(msg);
-      context.push({
-        role: msg.author?.id === botUserId ? "assistant" : "user",
-        content: text
-      });
-    }
-
-    // Inline text-file attachments before image enrichment, which rewrites the
-    // last user turn's content into a parts array (where the string-append below
-    // would no longer apply).
-    await enrichContextWithTextFiles(context, keptMessages);
-
-    // Collect the most-recent N images from thread history and attach them ALL
-    // to the last user turn (which is the current request). See slack.js for
-    // rationale (input_image on assistant role is not accepted).
-    const collected = [];
-    let budget = maxImagesInContext;
-    for (let i = keptMessages.length - 1; i >= 0 && budget > 0; i--) {
-      const attachments = keptMessages[i]?.attachments;
-      if (!attachments || attachments.size === 0) {
-        continue;
-      }
-      for (const attachment of attachments.values()) {
-        if (budget <= 0) {
-          break;
-        }
-        const dataUrl = await fetchDiscordImageAsDataUrl(attachment);
-        if (dataUrl) {
-          collected.unshift(dataUrl);
-          budget--;
-        }
-      }
-    }
-
-    if (collected.length === 0) {
-      return context;
-    }
-
-    let lastUserIdx = -1;
-    for (let i = context.length - 1; i >= 0; i--) {
-      if (context[i].role === "user") {
-        lastUserIdx = i;
-        break;
-      }
-    }
-    if (lastUserIdx === -1) {
-      return context;
-    }
-
-    const enriched = [...context];
-    const lastText = context[lastUserIdx].content;
-    const parts = [];
-    if (typeof lastText === "string" && lastText.trim()) {
-      parts.push({ type: "input_text", text: lastText });
-    }
-    for (const url of collected) {
-      parts.push({ type: "input_image", image_url: url });
-    }
-    enriched[lastUserIdx] = { role: "user", content: parts };
-    return enriched;
-  }
 
   const discordMaxLength = 2000;
 
@@ -496,7 +411,7 @@ export async function startDiscordBot(config, options) {
       // No starter (e.g. forum/standalone thread) — fall through to the fetch.
     }
     try {
-      const fetched = await channel.messages.fetch({ limit: maxThreadHistory });
+      const fetched = await channel.messages.fetch({ limit: 100 });
       for (const msg of fetched.values()) {
         // Bot already spoke here, or a user pulled it in via mention earlier in
         // the thread — either way it's an active participant.
@@ -570,7 +485,7 @@ export async function startDiscordBot(config, options) {
         console.error("[discord][reaction_add] skipped", error);
       }
 
-      const context = await buildContext(message, client.user.id);
+      const context = await buildDiscordContext(message, client.user.id, maxContextBytes);
       const lastUserMessage = [...context].reverse().find((msg) => msg.role === "user");
       if (!lastUserMessage) {
         await message.reply("질문을 같이 보내주세요.");
@@ -811,8 +726,7 @@ export async function startDiscordBot(config, options) {
           // H-2: reply w/ messageReference + failIfNotExists:false already
           // degrades silently when the original message is gone. If the send
           // still throws (network/rate-limit/perm), fall back to a plain
-          // channel.send so the thread still gets the placeholder row that
-          // buildContext needs for continuity (M-5).
+          // channel.send so the context builder still sees an assistant turn.
           try {
             await message.channel.send({
               content: collectedFiles.length > 0 ? "파일을 첨부했습니다." : "이미지를 생성했습니다.",
