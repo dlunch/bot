@@ -15,9 +15,10 @@ import { AttachmentBuilder } from "discord.js";
 // ---------------------------------------------------------------------------
 
 /** Build a fake Discord message with a spyable channel.send. */
-function makeFakeMessage({ sendImpl } = {}) {
+function makeFakeMessage({ sendImpl, inThread = false } = {}) {
   const sendCalls = [];
   const channel = {
+    isThread: () => inThread,
     async send(arg) {
       sendCalls.push(arg);
       if (typeof sendImpl === "function") {
@@ -117,6 +118,26 @@ test("(B2) deliverDiscordImages uses empty content when revisedPrompt is missing
   assert.equal(message.sendCalls[0].content, "");
 });
 
+test("deliverDiscordImages omits reply references for thread content and embeds", async () => {
+  const message = makeFakeMessage({ inThread: true });
+  const images = [
+    { id: "short", buffer: Buffer.from("short"), revisedPrompt: "short prompt" },
+    { id: "long", buffer: Buffer.from("long"), revisedPrompt: "x".repeat(2_001) }
+  ];
+
+  const silence = silenceConsole();
+  try {
+    await deliverDiscordImages(message, { images });
+  } finally {
+    silence.restore();
+  }
+
+  assert.equal(message.sendCalls.length, 2);
+  assert.equal(Object.hasOwn(message.sendCalls[0], "reply"), false);
+  assert.equal(Object.hasOwn(message.sendCalls[1], "reply"), false);
+  assert.equal(message.sendCalls[1].embeds.length, 1);
+});
+
 // ---------------------------------------------------------------------------
 // (C) deliverDiscordImages with multiple images
 // ---------------------------------------------------------------------------
@@ -156,6 +177,7 @@ test("(C) deliverDiscordImages with multiple images sends one message per image 
 test("(D) send failure on first image posts error fallback and continues to remaining images", async () => {
   const sendCalls = [];
   const channel = {
+    isThread: () => false,
     async send(arg) {
       sendCalls.push(arg);
       // First call (primary upload for image 1) throws.

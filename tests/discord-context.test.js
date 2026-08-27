@@ -4,7 +4,9 @@ import assert from "node:assert/strict";
 import {
   buildDiscordContext,
   collectDiscordChannelCandidates,
-  collectDiscordReplyCandidates
+  collectDiscordReplyCandidates,
+  collectDiscordThreadCandidates,
+  materializeDiscordMessage
 } from "../src/connectors/discord.js";
 import { collectRecentContext } from "../src/connectors/context.js";
 
@@ -98,31 +100,69 @@ test("paginates isolated channels past one hundred messages and fixes the curren
   ]);
 });
 
-test("stops isolated-channel pagination at the byte boundary before loading a starter", async () => {
+test("stops thread context at the byte boundary before loading a starter or its ancestry", async () => {
   let starterFetches = 0;
-  const current = { id: "current", createdTimestamp: 300, content: "new" };
+  let starterReferenceFetches = 0;
+  let parentPaginationFetches = 0;
+  const current = {
+    id: "current",
+    channelId: "thread",
+    createdTimestamp: 300,
+    content: "new",
+    author: { id: "user" },
+    embeds: [],
+    attachments: messages([])
+  };
   const page = Array.from({ length: 100 }, (_, index) => ({
     id: `old-${index}`,
+    channelId: "thread",
     createdTimestamp: 299 - index,
-    content: index === 0 ? "overflow" : "unused"
+    content: index === 0 ? "overflow" : "unused",
+    author: { id: "user" },
+    embeds: [],
+    attachments: messages([])
   }));
   current.channel = {
+    type: 11,
     isThread: () => true,
     messages: { fetch: async () => messages(page) },
     async fetchStarterMessage() {
       starterFetches += 1;
-      return { id: "starter", createdTimestamp: 1, content: "starter" };
+      return {
+        id: "starter",
+        channelId: "thread",
+        system: true,
+        reference: { messageId: "parent-starter", channelId: "parent" },
+        async fetchReference() {
+          starterReferenceFetches += 1;
+          return {
+            id: "parent-starter",
+            channelId: "parent",
+            createdTimestamp: 1,
+            content: "starter",
+            author: { id: "bot" },
+            embeds: [],
+            attachments: messages([]),
+            channel: {
+              messages: {
+                async fetch() {
+                  parentPaginationFetches += 1;
+                  return messages([]);
+                }
+              }
+            }
+          };
+        }
+      };
     }
   };
 
-  const result = await collectRecentContext(
-    collectDiscordChannelCandidates(current),
-    5,
-    async (message) => ({ source: message, role: "user", content: message.content })
-  );
+  const result = await buildDiscordContext(current, "bot", 5);
 
   assert.deepEqual(result.map(({ content }) => content), ["new"]);
   assert.equal(starterFetches, 0);
+  assert.equal(starterReferenceFetches, 0);
+  assert.equal(parentPaginationFetches, 0);
 });
 
 test("includes a Discord thread starter within and exactly at the byte boundary", async () => {
@@ -224,6 +264,7 @@ test("restores paginated bot chunks before the direct reply in chronological ord
   parent.channel = channel;
   second.channel = channel;
   third.channel = channel;
+  current.fetchReference = async () => parent;
 
   const result = await collectRecentContext(
     collectDiscordReplyCandidates(current, botUserId),
@@ -250,7 +291,7 @@ test("keeps the triggering reply when its parent cannot be loaded", async () => 
     createdTimestamp: 300,
     content: "question",
     reference: { messageId: "deleted" },
-    channel: { messages: { fetch: async () => { throw new Error("missing"); } } }
+    fetchReference: async () => { throw new Error("missing"); }
   };
   const collected = [];
   try {
@@ -262,6 +303,262 @@ test("keeps the triggering reply when its parent cannot be loaded", async () => 
   }
 
   assert.deepEqual(collected, [current]);
+});
+
+test("bridges a new thread to the starter reply chain and excludes the system proxy", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const attachmentFetches = [];
+  globalThis.fetch = async (url) => {
+    attachmentFetches.push(url);
+    throw new Error("system attachments must not be loaded");
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const parentChannel = {
+    messages: {
+      async fetch(params) {
+        assert.deepEqual(params, { after: "answer-1", limit: 100 });
+        return messages([answer2, starterSource]);
+      }
+    }
+  };
+  const originalQuestion = {
+    id: "question-1",
+    channelId: "parent",
+    createdTimestamp: 100,
+    content: "original question",
+    author: { id: "user" },
+    embeds: [],
+    attachments: messages([]),
+    channel: parentChannel
+  };
+  const answer1 = {
+    id: "answer-1",
+    channelId: "parent",
+    createdTimestamp: 110,
+    content: "first answer chunk",
+    author: { id: "bot" },
+    reference: { messageId: originalQuestion.id },
+    embeds: [],
+    attachments: messages([]),
+    channel: parentChannel,
+    fetchReference: async () => originalQuestion
+  };
+  const answer2 = {
+    id: "answer-2",
+    channelId: "parent",
+    createdTimestamp: 120,
+    content: "second answer chunk",
+    author: { id: "bot" },
+    reference: { messageId: answer1.id },
+    embeds: [],
+    attachments: messages([]),
+    channel: parentChannel
+  };
+  const starterSource = {
+    id: "starter-shared",
+    channelId: "parent",
+    createdTimestamp: 130,
+    content: "follow-up that opened the thread",
+    author: { id: "user" },
+    reference: { messageId: answer1.id },
+    embeds: [],
+    attachments: messages([]),
+    channel: parentChannel,
+    fetchReference: async () => answer1
+  };
+  const systemProxy = {
+    id: "starter-shared",
+    channelId: "thread",
+    createdTimestamp: 130,
+    system: true,
+    content: "system proxy content",
+    author: { id: "user" },
+    reference: { messageId: starterSource.id, channelId: "parent" },
+    embeds: [{ description: "system proxy embed" }],
+    attachments: discordFiles(1),
+    fetchReference: async () => starterSource
+  };
+  const current = {
+    id: "thread-current",
+    channelId: "thread",
+    createdTimestamp: 200,
+    content: "continue here",
+    author: { id: "user" },
+    embeds: [],
+    attachments: messages([])
+  };
+  current.channel = {
+    type: 11,
+    isThread: () => true,
+    messages: { fetch: async () => messages([systemProxy]) },
+    fetchStarterMessage: async () => systemProxy
+  };
+  systemProxy.channel = current.channel;
+
+  const context = await buildDiscordContext(current, "bot", 10_000);
+
+  assert.deepEqual(context.map(({ content }) => content), [
+    "original question",
+    "first answer chunk",
+    "second answer chunk",
+    "follow-up that opened the thread",
+    "continue here"
+  ]);
+  assert.deepEqual(attachmentFetches, []);
+});
+
+test("deduplicates thread candidates by channel and message identity", async () => {
+  const duplicate = {
+    id: "duplicate",
+    channelId: "thread",
+    createdTimestamp: 190,
+    content: "thread history"
+  };
+  const starterSource = {
+    id: "shared",
+    channelId: "parent",
+    createdTimestamp: 100,
+    content: "starter source"
+  };
+  const systemProxy = {
+    id: "shared",
+    channelId: "thread",
+    createdTimestamp: 100,
+    system: true,
+    reference: { messageId: starterSource.id, channelId: "parent" },
+    fetchReference: async () => starterSource
+  };
+  const current = {
+    id: "current",
+    channelId: "thread",
+    createdTimestamp: 200,
+    content: "current"
+  };
+  current.channel = {
+    isThread: () => true,
+    messages: { fetch: async () => messages([duplicate, duplicate]) },
+    fetchStarterMessage: async () => systemProxy
+  };
+
+  const collected = [];
+  for await (const candidate of collectDiscordThreadCandidates(current, "bot")) {
+    collected.push(`${candidate.channelId}:${candidate.id}`);
+  }
+
+  assert.deepEqual(collected, [
+    "thread:current",
+    "thread:duplicate",
+    "parent:shared"
+  ]);
+});
+
+test("never materializes Discord system messages", async () => {
+  let attachmentReads = 0;
+  const result = await materializeDiscordMessage({
+    system: true,
+    content: "copied content",
+    author: { id: "user" },
+    embeds: [{ description: "copied embed" }],
+    attachments: {
+      values() {
+        attachmentReads += 1;
+        return [];
+      }
+    }
+  }, "bot");
+
+  assert.equal(result, null);
+  assert.equal(attachmentReads, 0);
+});
+
+test("terminates reply ancestry cycles without duplicating candidates", async () => {
+  const first = {
+    id: "first",
+    channelId: "parent",
+    reference: { messageId: "second" }
+  };
+  const second = {
+    id: "second",
+    channelId: "parent",
+    reference: { messageId: "first" }
+  };
+  first.fetchReference = async () => second;
+  second.fetchReference = async () => first;
+
+  const collected = [];
+  for await (const candidate of collectDiscordReplyCandidates(first, "bot")) {
+    collected.push(candidate.id);
+  }
+
+  assert.deepEqual(collected, ["first", "second"]);
+});
+
+test("keeps partial thread candidates when local history or starter references fail", async () => {
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const starterSource = {
+      id: "starter-source",
+      channelId: "parent",
+      content: "starter source"
+    };
+    const currentAfterHistoryFailure = {
+      id: "current-history-failure",
+      channelId: "thread",
+      createdTimestamp: 200,
+      content: "current"
+    };
+    currentAfterHistoryFailure.channel = {
+      messages: { fetch: async () => { throw new Error("history unavailable"); } },
+      fetchStarterMessage: async () => starterSource
+    };
+
+    const afterHistoryFailure = [];
+    for await (const candidate of collectDiscordThreadCandidates(
+      currentAfterHistoryFailure,
+      "bot"
+    )) {
+      afterHistoryFailure.push(candidate.id);
+    }
+    assert.deepEqual(afterHistoryFailure, ["current-history-failure", "starter-source"]);
+
+    const local = {
+      id: "local",
+      channelId: "thread",
+      createdTimestamp: 190,
+      content: "local"
+    };
+    const currentAfterReferenceFailure = {
+      id: "current-reference-failure",
+      channelId: "thread",
+      createdTimestamp: 200,
+      content: "current"
+    };
+    currentAfterReferenceFailure.channel = {
+      messages: { fetch: async () => messages([local]) },
+      fetchStarterMessage: async () => ({
+        id: "system-starter",
+        channelId: "thread",
+        system: true,
+        reference: { messageId: "missing", channelId: "parent" },
+        fetchReference: async () => { throw new Error("reference unavailable"); }
+      })
+    };
+
+    const afterReferenceFailure = [];
+    for await (const candidate of collectDiscordThreadCandidates(
+      currentAfterReferenceFailure,
+      "bot"
+    )) {
+      afterReferenceFailure.push(candidate.id);
+    }
+    assert.deepEqual(afterReferenceFailure, ["current-reference-failure", "local"]);
+  } finally {
+    console.warn = originalWarn;
+  }
 });
 
 test("builds Discord context with six text files and every image within the file-size limit", async (t) => {

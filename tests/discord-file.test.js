@@ -8,7 +8,10 @@ test("deliverDiscordFiles uploads UTF-8 text with a safe reply payload", async (
   const calls = [];
   const message = {
     id: "source-1",
-    channel: { send: async (payload) => calls.push(payload) }
+    channel: {
+      isThread: () => false,
+      send: async (payload) => calls.push(payload)
+    }
   };
 
   await deliverDiscordFiles(message, {
@@ -26,6 +29,24 @@ test("deliverDiscordFiles uploads UTF-8 text with a safe reply payload", async (
   assert.deepEqual(calls[0].files[0].attachment, Buffer.from("print('안녕')\n", "utf8"));
 });
 
+test("deliverDiscordFiles omits reply references inside threads", async () => {
+  const calls = [];
+  const message = {
+    id: "thread-source",
+    channel: {
+      isThread: () => true,
+      send: async (payload) => calls.push(payload)
+    }
+  };
+
+  await deliverDiscordFiles(message, {
+    files: [{ filename: "thread.txt", content: "thread output" }]
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(Object.hasOwn(calls[0], "reply"), false);
+});
+
 test("deliverDiscordFiles isolates upload errors and continues", async () => {
   const calls = [];
   const oldError = console.error;
@@ -33,6 +54,7 @@ test("deliverDiscordFiles isolates upload errors and continues", async () => {
   const message = {
     id: "source-2",
     channel: {
+      isThread: () => false,
       async send(payload) {
         calls.push(payload);
         if (calls.length === 1) throw new Error("upload failed");

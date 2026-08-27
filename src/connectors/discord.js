@@ -16,7 +16,7 @@ export function sanitizeFilenameId(id) {
 /**
  * Deliver collected images to a Discord channel as new messages. Each image
  * is sent as its own message so the (optional) revised_prompt maps 1:1 with
- * the attachment. All sends use `allowedMentions: { parse: [] }` (C-3) so
+ * the attachment. All sends use `allowedMentions: { parse: [] }` so
  * any `@here`/`@everyone`/user-mention substrings in `revisedPrompt` can
  * never trigger an actual notification.
  *
@@ -24,9 +24,8 @@ export function sanitizeFilenameId(id) {
  * message is posted to the same channel, and iteration continues with the
  * remaining images. A no-op when the images array is empty.
  *
- * @param {object} message - The originating Discord message (used for
- *   `message.channel.send` and as the reply reference so images land in the
- *   same thread/channel as the text response).
+ * @param {object} message - The originating Discord message, used to select
+ *   the destination channel and the non-thread reply reference.
  * @param {{images: Array<{id: string, buffer: Buffer, revisedPrompt?: string}>}} opts
  */
 export async function deliverDiscordImages(message, { images } = {}) {
@@ -55,9 +54,14 @@ export async function deliverDiscordImages(message, { images } = {}) {
     const filename = `image-${sanitizeFilenameId(image?.id)}.png`;
     try {
       const attachment = new AttachmentBuilder(image.buffer, { name: filename });
-      const replyRef = message?.id
-        ? { messageReference: message.id, failIfNotExists: false }
-        : undefined;
+      const replyPayload = channel.isThread()
+        ? {}
+        : {
+            reply: {
+              messageReference: message.id,
+              failIfNotExists: false
+            }
+          };
 
       let payload;
       if (rawPrompt.length <= discordContentMax) {
@@ -65,7 +69,7 @@ export async function deliverDiscordImages(message, { images } = {}) {
           content: rawPrompt,
           files: [attachment],
           allowedMentions: { parse: [] },
-          reply: replyRef
+          ...replyPayload
         };
       } else {
         const embed = new EmbedBuilder()
@@ -75,7 +79,7 @@ export async function deliverDiscordImages(message, { images } = {}) {
           embeds: [embed],
           files: [attachment],
           allowedMentions: { parse: [] },
-          reply: replyRef
+          ...replyPayload
         };
       }
       await channel.send(payload);
@@ -114,9 +118,14 @@ export async function deliverDiscordFiles(message, { files } = {}) {
       await channel.send({
         files: [attachment],
         allowedMentions: { parse: [] },
-        reply: message?.id
-          ? { messageReference: message.id, failIfNotExists: false }
-          : undefined
+        ...(channel.isThread()
+          ? {}
+          : {
+              reply: {
+                messageReference: message.id,
+                failIfNotExists: false
+              }
+            })
       });
       console.log(`[discord][file_deliver] filename=${file.filename}`);
     } catch (err) {
@@ -178,18 +187,22 @@ async function scanDiscordBotChunks(seedMessage, botUserId, cutoffTimestamp) {
 
 export async function* collectDiscordReplyCandidates(message, botUserId) {
   yield message;
-  const seen = new Set([message.id]);
+  const seen = new Set([`${message.channelId}:${message.id}`]);
   let current = message;
-  while (true) {
-    const refId = current?.reference?.messageId;
-    if (!refId || seen.has(refId)) {
-      break;
-    }
+  while (current.reference?.messageId) {
     let parent;
     try {
-      parent = await current.channel.messages.fetch(refId);
+      parent = await current.fetchReference();
     } catch (error) {
-      console.warn(`[discord][reply_chain] fetch failed id=${refId}`, error);
+      console.warn(
+        `[discord][reply_chain] fetch failed id=${current.reference.messageId}`,
+        error
+      );
+      break;
+    }
+
+    const parentKey = `${parent.channelId}:${parent.id}`;
+    if (seen.has(parentKey)) {
       break;
     }
 
@@ -201,24 +214,23 @@ export async function* collectDiscordReplyCandidates(message, botUserId) {
       );
       for (let index = forwardChunks.length - 1; index >= 0; index--) {
         const chunk = forwardChunks[index];
-        if (!seen.has(chunk.id)) {
-          seen.add(chunk.id);
+        const chunkKey = `${chunk.channelId}:${chunk.id}`;
+        if (!seen.has(chunkKey)) {
+          seen.add(chunkKey);
           yield chunk;
         }
       }
     }
 
-    if (!seen.has(parent.id)) {
-      seen.add(parent.id);
-      yield parent;
-    }
+    seen.add(parentKey);
+    yield parent;
     current = parent;
   }
 }
 
 export async function* collectDiscordChannelCandidates(message) {
   yield message;
-  const seen = new Set([message.id]);
+  const seen = new Set([`${message.channelId}:${message.id}`]);
   const snapshotTimestamp = message.createdTimestamp || Number.POSITIVE_INFINITY;
   let cursor = message.id;
 
@@ -234,13 +246,14 @@ export async function* collectDiscordChannelCandidates(message) {
       (a, b) => (b.createdTimestamp || 0) - (a.createdTimestamp || 0)
     );
     for (const candidate of page) {
+      const candidateKey = `${candidate.channelId}:${candidate.id}`;
       if (
-        seen.has(candidate.id) ||
+        seen.has(candidateKey) ||
         (candidate.createdTimestamp || 0) > snapshotTimestamp
       ) {
         continue;
       }
-      seen.add(candidate.id);
+      seen.add(candidateKey);
       yield candidate;
     }
 
@@ -250,19 +263,44 @@ export async function* collectDiscordChannelCandidates(message) {
     }
     cursor = nextCursor;
   }
+}
 
-  if (typeof message.channel?.isThread === "function" && message.channel.isThread()) {
+export async function* collectDiscordThreadCandidates(message, botUserId) {
+  const seen = new Set();
+  for await (const candidate of collectDiscordChannelCandidates(message)) {
+    const candidateKey = `${candidate.channelId}:${candidate.id}`;
+    if (!seen.has(candidateKey)) {
+      seen.add(candidateKey);
+      yield candidate;
+    }
+  }
+
+  let starter;
+  try {
+    starter = await message.channel.fetchStarterMessage();
+  } catch (error) {
+    console.warn("[discord][context] starter fetch failed", error);
+    return;
+  }
+  if (!starter) {
+    return;
+  }
+
+  let root = starter;
+  if (starter.system) {
     try {
-      const starter = await message.channel.fetchStarterMessage?.();
-      if (
-        starter &&
-        !seen.has(starter.id) &&
-        (starter.createdTimestamp || 0) <= snapshotTimestamp
-      ) {
-        yield starter;
-      }
-    } catch {
-      // Deleted and standalone threads have no accessible starter.
+      root = await starter.fetchReference();
+    } catch (error) {
+      console.warn("[discord][context] starter reference fetch failed", error);
+      return;
+    }
+  }
+
+  for await (const candidate of collectDiscordReplyCandidates(root, botUserId)) {
+    const candidateKey = `${candidate.channelId}:${candidate.id}`;
+    if (!seen.has(candidateKey)) {
+      seen.add(candidateKey);
+      yield candidate;
     }
   }
 }
@@ -280,6 +318,9 @@ function hasDiscordImageAttachment(message) {
 }
 
 export async function materializeDiscordMessage(message, botUserId) {
+  if (message.system) {
+    return null;
+  }
   if (message.author?.bot && message.author.id !== botUserId) {
     return null;
   }
@@ -358,13 +399,12 @@ async function fetchDiscordImageAsDataUrl(attachment) {
 }
 
 export async function buildDiscordContext(message, botUserId, maxContextBytes) {
-  const useReplyChain =
-    typeof message.channel?.isThread === "function" &&
-    !message.channel.isThread() &&
-    message.channel.type !== 1;
-  const candidates = useReplyChain
-    ? collectDiscordReplyCandidates(message, botUserId)
-    : collectDiscordChannelCandidates(message);
+  const inThread = message.channel.isThread();
+  const candidates = inThread
+    ? collectDiscordThreadCandidates(message, botUserId)
+    : message.channel.type === 1
+      ? collectDiscordChannelCandidates(message)
+      : collectDiscordReplyCandidates(message, botUserId);
   const selected = await collectRecentContext(
     candidates,
     maxContextBytes,
@@ -399,31 +439,54 @@ export async function startDiscordBot(config, options) {
   }
 
   async function botParticipatesInThread(channel, botUserId) {
-    // A thread spun off the bot's own message keeps that message as the thread
-    // STARTER, which lives in the parent channel and never shows up in the
-    // in-thread fetch below. Check it first so those threads aren't missed.
-    try {
-      const starter = await channel.fetchStarterMessage?.();
-      if (starter?.author?.id === botUserId) {
-        return true;
-      }
-    } catch {
-      // No starter (e.g. forum/standalone thread) — fall through to the fetch.
-    }
     try {
       const fetched = await channel.messages.fetch({ limit: 100 });
       for (const msg of fetched.values()) {
-        // Bot already spoke here, or a user pulled it in via mention earlier in
-        // the thread — either way it's an active participant.
-        if (msg.author?.id === botUserId || msg.mentions?.has?.(botUserId)) {
+        if (
+          !msg.system &&
+          (msg.author?.id === botUserId || msg.mentions?.has?.(botUserId))
+        ) {
           return true;
         }
       }
-      return false;
     } catch (error) {
       console.warn("[discord][thread_participation] fetch failed", error);
+    }
+
+    let current;
+    try {
+      current = await channel.fetchStarterMessage();
+    } catch (error) {
+      console.warn("[discord][thread_participation] starter fetch failed", error);
       return false;
     }
+
+    const seen = new Set();
+    while (current) {
+      const currentKey = `${current.channelId}:${current.id}`;
+      if (seen.has(currentKey)) {
+        return false;
+      }
+      seen.add(currentKey);
+
+      if (
+        !current.system &&
+        (current.author?.id === botUserId || current.mentions?.has?.(botUserId))
+      ) {
+        return true;
+      }
+      if (!current.reference?.messageId) {
+        return false;
+      }
+
+      try {
+        current = await current.fetchReference();
+      } catch (error) {
+        console.warn("[discord][thread_participation] reference fetch failed", error);
+        return false;
+      }
+    }
+    return false;
   }
 
   client.on("messageCreate", async (message) => {
@@ -431,7 +494,7 @@ export async function startDiscordBot(config, options) {
       return;
     }
 
-    if (message.author?.bot) {
+    if (message.system || message.author?.bot) {
       return;
     }
 
@@ -471,7 +534,7 @@ export async function startDiscordBot(config, options) {
     let syncInFlight = Promise.resolve();
     // Collected image payloads from the AI layer's onImage callback. Buffered
     // during streaming and delivered after text sync completes so the text
-    // response shows up first (per arch §7.2 UX decision).
+    // response shows up first.
     const collectedImages = [];
     const collectedFiles = [];
     const imageGenerationEnabled = config.imageGeneration === true;
@@ -488,7 +551,14 @@ export async function startDiscordBot(config, options) {
       const context = await buildDiscordContext(message, client.user.id, maxContextBytes);
       const lastUserMessage = [...context].reverse().find((msg) => msg.role === "user");
       if (!lastUserMessage) {
-        await message.reply("질문을 같이 보내주세요.");
+        if (inThread) {
+          await message.channel.send({
+            content: "질문을 같이 보내주세요.",
+            allowedMentions: { parse: [] }
+          });
+        } else {
+          await message.reply("질문을 같이 보내주세요.");
+        }
         return;
       }
 
@@ -546,7 +616,7 @@ export async function startDiscordBot(config, options) {
             allowedMentions: { parse: [] }
           });
         }
-        // Chain subsequent chunks to the previous chunk so walkReplyChain can
+        // Chain subsequent chunks to the previous chunk so reply-chain context can
         // recover the full answer when the user replies to any single chunk.
         return message.channel.send({
           content: text,
@@ -642,9 +712,14 @@ export async function startDiscordBot(config, options) {
             fileProgressMessage = await message.channel.send({
               content: "📎 파일 생성 중...",
               allowedMentions: { parse: [] },
-              reply: message?.id
-                ? { messageReference: message.id, failIfNotExists: false }
-                : undefined
+              ...(inThread
+                ? {}
+                : {
+                    reply: {
+                      messageReference: message.id,
+                      failIfNotExists: false
+                    }
+                  })
             });
           } catch (err) {
             console.error("[discord][file_progress] failed", err);
@@ -668,9 +743,14 @@ export async function startDiscordBot(config, options) {
                 imageProgressMessage = await message.channel.send({
                   content: "🎨 이미지 생성 중...",
                   allowedMentions: { parse: [] },
-                  reply: message?.id
-                    ? { messageReference: message.id, failIfNotExists: false }
-                    : undefined
+                  ...(inThread
+                    ? {}
+                    : {
+                        reply: {
+                          messageReference: message.id,
+                          failIfNotExists: false
+                        }
+                      })
                 });
               } catch (err) {
                 console.error("[discord][image_progress] failed", err);
@@ -719,37 +799,21 @@ export async function startDiscordBot(config, options) {
       await runSyncReply(true);
 
       // Attachment delivery (post-text). If we have attachments but no text,
-      // post a placeholder message first (M-5) so thread history keeps an
-      // assistant turn for continuity.
+      // post a placeholder so history keeps an assistant turn for continuity.
       if (collectedFiles.length > 0 || collectedImages.length > 0) {
         if (!streamedText.trim()) {
-          // H-2: reply w/ messageReference + failIfNotExists:false already
-          // degrades silently when the original message is gone. If the send
-          // still throws (network/rate-limit/perm), fall back to a plain
-          // channel.send so the context builder still sees an assistant turn.
-          try {
-            await message.channel.send({
-              content: collectedFiles.length > 0 ? "파일을 첨부했습니다." : "이미지를 생성했습니다.",
-              allowedMentions: { parse: [] },
-              reply: { messageReference: message.id, failIfNotExists: false }
-            });
-          } catch (placeholderErr) {
-            console.error(
-              "[discord][image_placeholder] failed; retrying without reply ref",
-              placeholderErr
-            );
-            try {
-              await message.channel.send({
-                content: collectedFiles.length > 0 ? "파일을 첨부했습니다." : "이미지를 생성했습니다.",
-                allowedMentions: { parse: [] }
-              });
-            } catch (retryErr) {
-              console.error(
-                "[discord][image_placeholder] fallback also failed",
-                retryErr
-              );
-            }
-          }
+          await message.channel.send({
+            content: collectedFiles.length > 0 ? "파일을 첨부했습니다." : "이미지를 생성했습니다.",
+            allowedMentions: { parse: [] },
+            ...(inThread
+              ? {}
+              : {
+                  reply: {
+                    messageReference: message.id,
+                    failIfNotExists: false
+                  }
+                })
+          });
         }
         if (collectedFiles.length > 0) {
           await deliverDiscordFiles(message, { files: collectedFiles });
@@ -806,7 +870,14 @@ export async function startDiscordBot(config, options) {
             }
           }
         } else {
-          await message.reply("에러가 발생했습니다. 잠시 후 다시 시도해주세요.");
+          if (inThread) {
+            await message.channel.send({
+              content: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
+              allowedMentions: { parse: [] }
+            });
+          } else {
+            await message.reply("에러가 발생했습니다. 잠시 후 다시 시도해주세요.");
+          }
         }
       } catch (innerError) {
         console.error("[discord][message] error reply failed", innerError);
