@@ -6,7 +6,14 @@ import assert from "node:assert/strict";
 
 import { createAiResponse, __testing__ } from "../src/ai.js";
 
-const { parseCodexSseStream, callCodex } = __testing__;
+const {
+  parseCodexSseStream,
+  callCodex,
+  addOriginalUserTurnProtocol,
+  toResponsesInput,
+  toAnthropicMessages,
+  parseAnthropicImageDataUrl
+} = __testing__;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -107,6 +114,171 @@ function sseEvent(obj) {
 // A valid 1x1 PNG is not required; any non-empty bytes survive the decode.
 const HELLO_BUFFER = Buffer.from("hello world");
 const HELLO_B64 = HELLO_BUFFER.toString("base64");
+
+const protocolPreamble = "[APP_CONTEXT_PROTOCOL_START]";
+const userTurnDelimiter = "[APP_ORIGINAL_USER_TURN_FOLLOWS]";
+
+test("adds a static protocol preamble and assistant delimiter before every original user turn", () => {
+  const context = [
+    { role: "user", content: "past text" },
+    {
+      role: "user",
+      content: [{ type: "input_image", image_url: "data:image/png;base64,YQ==" }]
+    },
+    { role: "assistant", content: "answer" },
+    { role: "user", content: "current text" }
+  ];
+  Object.freeze(context[1].content[0]);
+  Object.freeze(context[1].content);
+  for (const message of context) Object.freeze(message);
+  Object.freeze(context);
+
+  const marked = addOriginalUserTurnProtocol(context);
+
+  assert.deepEqual(marked, [
+    { role: "user", content: protocolPreamble },
+    { role: "assistant", content: userTurnDelimiter },
+    { role: "user", content: "past text" },
+    { role: "assistant", content: userTurnDelimiter },
+    {
+      role: "user",
+      content: [{ type: "input_image", image_url: "data:image/png;base64,YQ==" }]
+    },
+    { role: "assistant", content: "answer" },
+    { role: "assistant", content: userTurnDelimiter },
+    { role: "user", content: "current text" }
+  ]);
+  assert.notStrictEqual(marked, context);
+  assert.notStrictEqual(marked[4], context[1]);
+  assert.notStrictEqual(marked[4].content, context[1].content);
+  assert.notStrictEqual(marked[4].content[0], context[1].content[0]);
+});
+
+test("builds Codex input with standalone assistant delimiters and unchanged canonical content", () => {
+  const context = [
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: "past" },
+        { type: "input_image", image_url: "data:image/png;base64,YQ==" }
+      ]
+    },
+    { role: "assistant", content: "answer" },
+    {
+      role: "user",
+      content: [{ type: "input_image", image_url: "data:image/jpeg;base64,Yg==" }]
+    }
+  ];
+
+  const result = toResponsesInput(context);
+
+  assert.deepEqual(result.map(({ role }) => role), [
+    "user", "assistant", "user", "assistant", "assistant", "user"
+  ]);
+  assert.equal(result[0].content, protocolPreamble);
+  assert.equal(result[1].content, userTurnDelimiter);
+  assert.deepEqual(result[2].content, context[0].content);
+  assert.equal(result[3].content, "answer");
+  assert.equal(result[4].content, userTurnDelimiter);
+  assert.equal(result[5].content[0].image_url, "data:image/jpeg;base64,Yg==");
+  assert.notStrictEqual(result[2].content[1], context[0].content[1]);
+});
+
+test("coalesces Anthropic messages while keeping the delimiter as the final assistant text block", () => {
+  const context = [
+    {
+      role: "user",
+      content: [{ type: "input_image", image_url: "data:image/png;base64,YQ==" }]
+    },
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: "current" },
+        { type: "input_image", image_url: "data:image/webp;base64,Yg==" }
+      ]
+    },
+    { role: "assistant", content: "answer" }
+  ];
+
+  const result = toAnthropicMessages(context);
+
+  assert.deepEqual(result, [
+    {
+      role: "user",
+      content: [{ type: "text", text: protocolPreamble }]
+    },
+    { role: "assistant", content: [{ type: "text", text: userTurnDelimiter }] },
+    {
+      role: "user",
+      content: [
+        {
+          type: "image", source: { type: "base64", media_type: "image/png", data: "YQ==" }
+        }
+      ]
+    },
+    { role: "assistant", content: [{ type: "text", text: userTurnDelimiter }] },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "current" },
+        { type: "image", source: { type: "base64", media_type: "image/webp", data: "Yg==" } }
+      ]
+    },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "answer" }
+      ]
+    }
+  ]);
+  assert.notStrictEqual(result[2].content[0], context[0].content[0]);
+  assert.notStrictEqual(result[2].content[0].source, context[0].content[0]);
+});
+
+test("coalesces a real Anthropic assistant turn with the following structural delimiter", () => {
+  const result = toAnthropicMessages([
+    { role: "user", content: "past" },
+    { role: "assistant", content: "answer" },
+    { role: "user", content: "current" }
+  ]);
+
+  assert.deepEqual(result[3], {
+    role: "assistant",
+    content: [
+      { type: "text", text: "answer" },
+      { type: "text", text: userTurnDelimiter }
+    ]
+  });
+  assert.deepEqual(result[4], {
+    role: "user",
+    content: [{ type: "text", text: "current" }]
+  });
+});
+
+test("accepts only anchored standard base64 data URLs for Anthropic supported image MIME types", () => {
+  for (const mediaType of ["image/jpeg", "image/png", "image/gif", "image/webp"]) {
+    assert.deepEqual(parseAnthropicImageDataUrl(`data:${mediaType};base64,YWJjZA==`), {
+      mediaType,
+      data: "YWJjZA=="
+    });
+  }
+
+  for (const invalid of [
+    "data:image/png;base64,",
+    "data:image/png;base64,YQ=",
+    "data:image/png;base64,YQ===",
+    "data:image/png;base64,Y=Q=",
+    "data:image/png;base64,Y Q==",
+    "data:image/png;base64,YQ-_",
+    "data:image/png;charset=utf-8;base64,YQ==",
+    "data:image/avif;base64,YQ==",
+    "data:image/PNG;base64,YQ==",
+    "prefixdata:image/png;base64,YQ==",
+    "data:image/png;base64,YQ==trailing"
+  ]) {
+    assert.throws(() => parseAnthropicImageDataUrl(invalid), /Invalid Anthropic image data URL/);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // callCodex: body.tools shape tests (A, B, C)

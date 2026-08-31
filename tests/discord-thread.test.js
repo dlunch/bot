@@ -229,6 +229,32 @@ test("sends top-level errors directly in threads without a reply payload", async
   assert.equal(Object.hasOwn(calls.send[0], "reply"), false);
 });
 
+test("asks for a supported image again when a Discord image-only thread request cannot load", async (t) => {
+  const fetchUrls = [];
+  const listener = await startDiscordHarness(t, async (url) => {
+    fetchUrls.push(String(url));
+    throw new Error("neither attachment nor provider should be fetched");
+  });
+  const { message, calls } = createDiscordMessage({ content: "" });
+  message.attachments = new Map([["unsupported", {
+    id: "unsupported",
+    name: "image.avif",
+    contentType: "image/avif",
+    url: "https://files.test/unsupported"
+  }]]);
+
+  await listener(message);
+
+  assert.deepEqual(fetchUrls, []);
+  assert.deepEqual(calls.reply, []);
+  assert.equal(calls.send.length, 1);
+  assert.equal(
+    calls.send[0].content,
+    "현재 요청의 이미지를 불러올 수 없어요. JPEG, PNG, GIF 또는 WebP 이미지를 다시 첨부해 주세요."
+  );
+  assert.equal(Object.hasOwn(calls.send[0], "reply"), false);
+});
+
 test("omits reply payloads from thread file progress, placeholder, and delivery", async (t) => {
   let round = 0;
   const listener = await startDiscordHarness(t, async () => {

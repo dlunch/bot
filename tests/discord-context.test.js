@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createAiResponse } from "../src/ai.js";
 
 import {
   buildDiscordContext,
@@ -474,6 +475,23 @@ test("never materializes Discord system messages", async () => {
   assert.equal(attachmentReads, 0);
 });
 
+test("excludes a descriptionless assistant image-only message", async () => {
+  const result = await materializeDiscordMessage({
+    system: false,
+    content: "",
+    author: { id: "bot", bot: true },
+    embeds: [],
+    attachments: messages([{
+      id: "generated",
+      name: "generated.png",
+      contentType: "image/png",
+      url: "https://files.test/generated"
+    }])
+  }, "bot");
+
+  assert.equal(result, null);
+});
+
 test("terminates reply ancestry cycles without duplicating candidates", async () => {
   const first = {
     id: "first",
@@ -627,4 +645,214 @@ test("uses all Discord text files for budgeting and loads images only from selec
   assert.equal(fetchCalls.filter(({ url }) => url.includes("text-")).length, 6);
   assert.ok(fetchCalls.some(({ url }) => url.endsWith("current-image")));
   assert.ok(!fetchCalls.some(({ url }) => url.endsWith("old-image")));
+});
+
+test("keeps supported Discord images on their source user turns and skips unsupported and assistant images", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200, arrayBuffer: async () => Buffer.from(url.at(-1)) };
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const attachment = (id, contentType) => ({
+    id,
+    name: `${id}.img`,
+    contentType,
+    url: `https://files.test/${id}`
+  });
+  const older = {
+    id: "older",
+    createdTimestamp: 100,
+    content: "older request",
+    author: { id: "user" },
+    embeds: [],
+    attachments: messages([attachment("older-png", " image/PNG ; charset=binary ")])
+  };
+  const assistant = {
+    id: "assistant",
+    createdTimestamp: 200,
+    content: "",
+    author: { id: "bot", bot: true },
+    embeds: [],
+    attachments: messages([attachment("assistant-png", "image/png")])
+  };
+  const current = {
+    id: "current",
+    createdTimestamp: 300,
+    content: "current request",
+    author: { id: "user" },
+    embeds: [],
+    attachments: messages([
+      attachment("current-jpeg", "IMAGE/JPEG"),
+      attachment("current-gif", "image/gif; name=x"),
+      attachment("current-webp", " image/webp "),
+      attachment("unsupported-avif", "image/avif")
+    ])
+  };
+  current.channel = {
+    type: 1,
+    isThread: () => false,
+    messages: { fetch: async () => messages([current, assistant, older]) }
+  };
+
+  const context = await buildDiscordContext(current, "bot", 20_000);
+
+  assert.equal(context.length, 2);
+  assert.deepEqual(context[0].content, [
+    { type: "input_text", text: "older request" },
+    { type: "input_image", image_url: "data:image/png;base64,Zw==" }
+  ]);
+  assert.deepEqual(context[1].content.map((part) => part.type), [
+    "input_text", "input_image", "input_image", "input_image"
+  ]);
+  assert.deepEqual(
+    context[1].content.slice(1).map((part) => part.image_url.split(";")[0]),
+    ["data:image/jpeg", "data:image/gif", "data:image/webp"]
+  );
+  assert.deepEqual(calls, [
+    "https://files.test/older-png",
+    "https://files.test/current-jpeg",
+    "https://files.test/current-gif",
+    "https://files.test/current-webp"
+  ]);
+});
+
+test("fails a Discord image-only current request with only unsupported images before download", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = async () => {
+    fetches += 1;
+    throw new Error("unsupported image must not be downloaded");
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const current = {
+    id: "current",
+    createdTimestamp: 300,
+    content: "",
+    author: { id: "user" },
+    embeds: [],
+    attachments: messages([{
+      id: "unsupported",
+      name: "misleading.txt",
+      contentType: " IMAGE/AVIF ; charset=binary ",
+      url: "https://files.test/unsupported"
+    }])
+  };
+  current.channel = {
+    type: 1,
+    isThread: () => false,
+    messages: { fetch: async () => messages([]) }
+  };
+
+  await assert.rejects(
+    buildDiscordContext(current, "bot", 20_000),
+    /Current user image-only request could not load any supported images/
+  );
+  assert.equal(fetches, 0);
+});
+
+test("carries Discord past and current images through to their marked Anthropic request segments", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalApiKey = process.env.ANTHROPIC_API_KEY;
+  let providerBody;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith("https://files.test/")) {
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => Buffer.from(String(url).split("/").at(-1))
+      };
+    }
+    if (String(url).includes("api.anthropic.com")) {
+      providerBody = JSON.parse(init.body);
+      return {
+        ok: true,
+        status: 200,
+        body: null,
+        text: async () => JSON.stringify({ content: [{ type: "text", text: "ok" }] })
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  process.env.ANTHROPIC_API_KEY = "test-key";
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = originalApiKey;
+  });
+
+  const older = {
+    id: "older",
+    createdTimestamp: 100,
+    content: "older request",
+    author: { id: "user" },
+    embeds: [],
+    attachments: messages([{
+      id: "older-image",
+      name: "older.png",
+      contentType: "image/png",
+      url: "https://files.test/older-image"
+    }])
+  };
+  const current = {
+    id: "current",
+    createdTimestamp: 200,
+    content: "current request",
+    author: { id: "user" },
+    embeds: [],
+    attachments: messages([{
+      id: "current-image",
+      name: "current.png",
+      contentType: "image/png",
+      url: "https://files.test/current-image"
+    }])
+  };
+  current.channel = {
+    type: 1,
+    isThread: () => false,
+    messages: { fetch: async () => messages([current, older]) }
+  };
+
+  const context = await buildDiscordContext(current, "bot", 20_000);
+  await createAiResponse(context, {
+    model: "claude-test",
+    providers: { anthropic: { models: ["claude-test"] } },
+    emptyRetryCount: 0
+  });
+
+  assert.deepEqual(providerBody.messages.map(({ role }) => role), [
+    "user", "assistant", "user", "assistant", "user"
+  ]);
+  assert.deepEqual(providerBody.messages[0].content, [
+    { type: "text", text: "[APP_CONTEXT_PROTOCOL_START]" }
+  ]);
+  assert.deepEqual(providerBody.messages[1].content.at(-1), {
+    type: "text", text: "[APP_ORIGINAL_USER_TURN_FOLLOWS]"
+  });
+  assert.deepEqual(providerBody.messages[3].content.at(-1), {
+    type: "text", text: "[APP_ORIGINAL_USER_TURN_FOLLOWS]"
+  });
+  assert.equal(providerBody.system.includes("[APP_CONTEXT_PROTOCOL_START]"), true);
+  assert.equal(providerBody.system.includes("[APP_ORIGINAL_USER_TURN_FOLLOWS]"), true);
+  assert.deepEqual(providerBody.messages[2].content.map((part) => part.type), [
+    "text", "image"
+  ]);
+  assert.deepEqual(providerBody.messages[4].content.map((part) => part.type), [
+    "text", "image"
+  ]);
+  assert.equal(
+    providerBody.messages[2].content[1].source.data,
+    Buffer.from("older-image").toString("base64")
+  );
+  assert.equal(
+    providerBody.messages[4].content[1].source.data,
+    Buffer.from("current-image").toString("base64")
+  );
 });

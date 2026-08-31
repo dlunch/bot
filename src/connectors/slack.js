@@ -1,7 +1,11 @@
 import SlackBolt from "@slack/bolt";
 import { createAiResponse } from "../ai.js";
 import { isTextLike, fetchTextAttachmentBlock } from "./attachments.js";
-import { attachImagesToLastUser, collectRecentContext } from "./context.js";
+import {
+  attachImagesToUserTurns,
+  collectRecentContext,
+  CurrentUserImageLoadError
+} from "./context.js";
 import { markdownChunk } from "./markdown-chunks.js";
 
 const { App, SocketModeReceiver } = SlackBolt;
@@ -237,12 +241,16 @@ function isDirectMessage(event) {
 
 function hasSlackImageFile(message) {
   return Array.isArray(message?.files) && message.files.some(
-    (file) => typeof file?.mimetype === "string" && file.mimetype.startsWith("image/")
+    (file) => typeof file?.mimetype === "string" &&
+      file.mimetype.split(";", 1)[0].trim().toLowerCase().startsWith("image/")
   );
 }
 
 function isSlackTextFile(file) {
-  if (typeof file?.mimetype === "string" && file.mimetype.startsWith("image/")) {
+  if (
+    typeof file?.mimetype === "string" &&
+    file.mimetype.split(";", 1)[0].trim().toLowerCase().startsWith("image/")
+  ) {
     return false;
   }
   return isTextLike(file?.name, file?.mimetype);
@@ -275,25 +283,48 @@ export async function materializeSlackMessage(message, botUserId, botToken) {
     }
   }
 
+  const role = (botUserId && message.user === botUserId) || message.bot_id
+    ? "assistant"
+    : "user";
   const finalContent = [content, ...blocks].filter(Boolean).join("\n\n");
+  if (!finalContent && role === "assistant") {
+    return null;
+  }
   if (!finalContent && !hasSlackImageFile(message)) {
     return null;
   }
   return {
     source: message,
-    role: (botUserId && message.user === botUserId) || message.bot_id ? "assistant" : "user",
+    role,
     content: finalContent
   };
 }
 
-async function fetchSlackImageAsDataUrl(file, botToken) {
+const supportedSlackImageMediaTypes = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp"
+]);
+
+function listSlackImages(message) {
+  const images = [];
+  for (const file of message.files || []) {
+    const mediaType = typeof file?.mimetype === "string"
+      ? file.mimetype.split(";", 1)[0].trim().toLowerCase()
+      : "";
+    if (supportedSlackImageMediaTypes.has(mediaType)) {
+      images.push({ source: file, mediaType });
+    }
+  }
+  return images;
+}
+
+async function fetchSlackImageAsDataUrl(candidate, botToken) {
   const maxImageBytes = 5 * 1024 * 1024;
+  const file = candidate.source;
   const fileUrl = file?.url_private_download || file?.url_private;
-  if (
-    !fileUrl ||
-    typeof file?.mimetype !== "string" ||
-    !file.mimetype.startsWith("image/")
-  ) {
+  if (!fileUrl) {
     return null;
   }
   try {
@@ -309,7 +340,7 @@ async function fetchSlackImageAsDataUrl(file, botToken) {
       console.warn(`[slack][image_fetch] skipping large file id=${file.id} bytes=${bytes.byteLength}`);
       return null;
     }
-    return `data:${file.mimetype};base64,${Buffer.from(bytes).toString("base64")}`;
+    return `data:${candidate.mediaType};base64,${Buffer.from(bytes).toString("base64")}`;
   } catch (error) {
     console.warn(`[slack][image_fetch] failed id=${file?.id}`, error);
     return null;
@@ -331,11 +362,11 @@ export async function buildSlackContext(client, event, options) {
       (message) => materializeSlackMessage(message, botUserId, botToken)
     );
     const context = selected.map(({ role, content }) => ({ role, content }));
-    return await attachImagesToLastUser(
+    return await attachImagesToUserTurns(
       context,
       selected.map(({ source }) => source),
-      (message) => message?.files || [],
-      (file) => fetchSlackImageAsDataUrl(file, botToken)
+      listSlackImages,
+      (candidate) => fetchSlackImageAsDataUrl(candidate, botToken)
     );
   }
 
@@ -359,11 +390,11 @@ export async function buildSlackContext(client, event, options) {
     (message) => materializeSlackMessage(message, botUserId, botToken)
   );
   const context = selected.map(({ role, content }) => ({ role, content }));
-  return await attachImagesToLastUser(
+  return await attachImagesToUserTurns(
     context,
     selected.map(({ source }) => source),
-    (message) => message?.files || [],
-    (file) => fetchSlackImageAsDataUrl(file, botToken)
+    listSlackImages,
+    (candidate) => fetchSlackImageAsDataUrl(candidate, botToken)
   );
 }
 
@@ -841,6 +872,9 @@ export async function startSlackBot(config, options) {
 
     } catch (error) {
       console.error(`[slack][${source}] error`, error);
+      const errorMessage = error instanceof CurrentUserImageLoadError
+        ? "현재 요청의 이미지를 불러올 수 없어요. JPEG, PNG, GIF 또는 WebP 이미지를 다시 첨부해 주세요."
+        : "에러가 발생했습니다. 잠시 후 다시 시도해주세요.";
       if (collectedFiles.length > 0) {
         console.error(
           `[slack] dropped ${collectedFiles.length} partial files due to stream error name=${config.name} source=${source}`
@@ -856,14 +890,16 @@ export async function startSlackBot(config, options) {
         );
       }
       if (replyTs) {
-        const errorSuffix = "\n\n⚠️ 출력 중 에러가 발생했습니다.";
+        const errorSuffix = error instanceof CurrentUserImageLoadError
+          ? `\n\n⚠️ ${errorMessage}`
+          : "\n\n⚠️ 출력 중 에러가 발생했습니다.";
         let errorText;
         const currentStreamedText = streamedText.slice(currentMsgOffset);
         if (currentStreamedText.trim()) {
           const maxContent = slackMaxLength - errorSuffix.length;
           errorText = currentStreamedText.trim().slice(0, maxContent) + errorSuffix;
         } else {
-          errorText = "에러가 발생했습니다. 잠시 후 다시 시도해주세요.";
+          errorText = errorMessage;
         }
         try {
           await withSlackRetry(() => client.chat.update({
@@ -890,7 +926,7 @@ export async function startSlackBot(config, options) {
       if (inDm) {
         await withSlackRetry(() => client.chat.postMessage({
           channel: event.channel,
-          text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
+          text: errorMessage,
           parse: "none",
           mrkdwn: true
         }), "error_post_message");
@@ -898,7 +934,7 @@ export async function startSlackBot(config, options) {
       }
 
       await withSlackRetry(() => say({
-        text: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
+        text: errorMessage,
         thread_ts: threadTs,
         parse: "none",
         mrkdwn: true

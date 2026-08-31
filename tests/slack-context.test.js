@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import SlackBolt from "@slack/bolt";
+import { createAiResponse } from "../src/ai.js";
 
 import {
   buildSlackContext,
   collectSlackDirectCandidates,
-  collectSlackThreadCandidates
+  collectSlackThreadCandidates,
+  materializeSlackMessage,
+  startSlackBot
 } from "../src/connectors/slack.js";
 import { collectRecentContext } from "../src/connectors/context.js";
 
@@ -52,6 +56,68 @@ function installSlackFileFetch(t) {
     console.warn = originalWarn;
   });
   return calls;
+}
+
+async function startSlackHandlerHarness(t, fetchImpl) {
+  const { App, webApi } = SlackBolt;
+  const originalEvent = App.prototype.event;
+  const originalError = App.prototype.error;
+  const originalStart = App.prototype.start;
+  const originalStop = App.prototype.stop;
+  const originalApiCall = webApi.WebClient.prototype.apiCall;
+  const originalFetch = globalThis.fetch;
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const originalErrorLog = console.error;
+  const handlers = {};
+  let app;
+
+  App.prototype.event = function registerEvent(name, handler) {
+    handlers[name] = handler;
+  };
+  App.prototype.error = function registerError() {};
+  App.prototype.start = async function start() {
+    app = this;
+  };
+  App.prototype.stop = async function stop() {};
+  webApi.WebClient.prototype.apiCall = async function apiCall(method) {
+    assert.equal(method, "auth.test");
+    return { user_id: "bot" };
+  };
+  globalThis.fetch = fetchImpl;
+  console.log = () => {};
+  console.warn = () => {};
+  console.error = () => {};
+
+  const runtime = await startSlackBot(
+    {
+      name: "context-test",
+      appToken: "xapp-test",
+      botToken: "xoxb-test",
+      models: ["test-model"],
+      providers: { anthropic: { models: ["test-model"] } },
+      webSearch: false,
+      systemPrompt: "test",
+      imageGeneration: false
+    },
+    { maxContextBytes: 200_000, slackStreamUpdateMs: 0 }
+  );
+
+  t.after(async () => {
+    await runtime.stop();
+    App.prototype.event = originalEvent;
+    App.prototype.error = originalError;
+    App.prototype.start = originalStart;
+    App.prototype.stop = originalStop;
+    webApi.WebClient.prototype.apiCall = originalApiCall;
+    globalThis.fetch = originalFetch;
+    console.log = originalLog;
+    console.warn = originalWarn;
+    console.error = originalErrorLog;
+  });
+
+  assert.ok(app);
+  return handlers.message;
 }
 
 test("stops direct-message pagination after the first overflowing message", async () => {
@@ -327,4 +393,295 @@ test("uses all Slack text files for budgeting and loads images only from selecte
   assert.equal(fetchCalls.filter(({ url }) => url.includes("text-")).length, 6);
   assert.ok(fetchCalls.some(({ url }) => url.endsWith("current-image")));
   assert.ok(!fetchCalls.some(({ url }) => url.endsWith("old-image")));
+});
+
+test("excludes a descriptionless assistant Slack image-only message", async () => {
+  const result = await materializeSlackMessage({
+    text: "",
+    bot_id: "B1",
+    files: [{
+      id: "generated",
+      name: "generated.png",
+      mimetype: "image/png",
+      url_private_download: "https://files.test/generated"
+    }]
+  }, "bot", "xoxb-test");
+
+  assert.equal(result, null);
+});
+
+test("keeps supported Slack images on their source user turns and skips unsupported and assistant images", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, arrayBuffer: async () => Buffer.from(url.at(-1)) };
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const file = (id, mimetype) => ({
+    id,
+    name: `${id}.img`,
+    mimetype,
+    url_private_download: `https://files.test/${id}`
+  });
+  const older = {
+    channel: "D1",
+    ts: "100.000001",
+    text: "older request",
+    user: "user",
+    files: [file("older-png", " image/PNG ; charset=binary ")]
+  };
+  const assistant = {
+    channel: "D1",
+    ts: "200.000001",
+    text: "",
+    bot_id: "B1",
+    files: [file("assistant-png", "image/png")]
+  };
+  const event = {
+    channel: "D1",
+    channel_type: "im",
+    ts: "300.000001",
+    text: "current request",
+    user: "user",
+    files: [
+      file("current-jpeg", "IMAGE/JPEG"),
+      file("current-gif", "image/gif; name=x"),
+      file("current-webp", " image/webp "),
+      file("unsupported-avif", "image/avif")
+    ]
+  };
+  const client = {
+    conversations: {
+      history: async () => ({
+        messages: [event, assistant, older],
+        response_metadata: { next_cursor: "" }
+      })
+    }
+  };
+
+  const context = await buildSlackContext(client, event, {
+    botUserId: "bot",
+    botToken: "xoxb-test",
+    maxContextBytes: 20_000,
+    withRetry: async (action) => action()
+  });
+
+  assert.equal(context.length, 2);
+  assert.deepEqual(context[0].content, [
+    { type: "input_text", text: "older request" },
+    { type: "input_image", image_url: "data:image/png;base64,Zw==" }
+  ]);
+  assert.deepEqual(
+    context[1].content.slice(1).map((part) => part.image_url.split(";")[0]),
+    ["data:image/jpeg", "data:image/gif", "data:image/webp"]
+  );
+  assert.deepEqual(calls.map(({ url }) => url), [
+    "https://files.test/older-png",
+    "https://files.test/current-jpeg",
+    "https://files.test/current-gif",
+    "https://files.test/current-webp"
+  ]);
+  for (const call of calls) {
+    assert.equal(call.options.headers.Authorization, "Bearer xoxb-test");
+  }
+});
+
+test("fails a Slack image-only current request with only unsupported images before download", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = async () => {
+    fetches += 1;
+    throw new Error("unsupported image must not be downloaded");
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const event = {
+    channel: "D1",
+    channel_type: "im",
+    ts: "300.000001",
+    text: "",
+    user: "user",
+    files: [{
+      id: "unsupported",
+      name: "misleading.txt",
+      mimetype: " IMAGE/AVIF ; charset=binary ",
+      url_private_download: "https://files.test/unsupported"
+    }]
+  };
+  const client = {
+    conversations: {
+      history: async () => ({ messages: [], response_metadata: { next_cursor: "" } })
+    }
+  };
+
+  await assert.rejects(
+    buildSlackContext(client, event, {
+      botUserId: "bot",
+      botToken: "xoxb-test",
+      maxContextBytes: 20_000,
+      withRetry: async (action) => action()
+    }),
+    /Current user image-only request could not load any supported images/
+  );
+  assert.equal(fetches, 0);
+});
+
+test("asks for a supported image again when a Slack image-only DM request cannot load", async (t) => {
+  const fetchUrls = [];
+  const handler = await startSlackHandlerHarness(t, async (url) => {
+    fetchUrls.push(String(url));
+    throw new Error("neither attachment nor provider should be fetched");
+  });
+  const posted = [];
+  const client = {
+    conversations: {
+      history: async () => ({ messages: [], response_metadata: { next_cursor: "" } })
+    },
+    reactions: {
+      add: async () => {},
+      remove: async () => {}
+    },
+    chat: {
+      postMessage: async (payload) => {
+        posted.push(payload);
+        return { ts: `reply-${posted.length}` };
+      },
+      update: async () => {},
+      delete: async () => {}
+    }
+  };
+  const event = {
+    channel: "D1",
+    channel_type: "im",
+    ts: "300.000001",
+    text: "",
+    user: "user",
+    files: [{
+      id: "unsupported",
+      name: "image.avif",
+      mimetype: "image/avif",
+      url_private_download: "https://files.test/unsupported"
+    }]
+  };
+
+  await handler({ event, client, say: async () => {} });
+
+  assert.deepEqual(fetchUrls, []);
+  assert.equal(posted.length, 1);
+  assert.equal(
+    posted[0].text,
+    "현재 요청의 이미지를 불러올 수 없어요. JPEG, PNG, GIF 또는 WebP 이미지를 다시 첨부해 주세요."
+  );
+  assert.equal(Object.hasOwn(posted[0], "thread_ts"), false);
+});
+
+test("carries Slack past and current images through to their delimited Codex request segments", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalRefreshToken = process.env.CODEX_REFRESH_TOKEN;
+  const originalRefreshFile = process.env.CODEX_REFRESH_TOKEN_FILE;
+  let providerBody;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith("https://files.test/")) {
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => Buffer.from(String(url).split("/").at(-1))
+      };
+    }
+    if (String(url).includes("auth.openai.com")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          access_token: "access-token",
+          refresh_token: "next-refresh-token",
+          expires_in: 3600
+        })
+      };
+    }
+    if (String(url).includes("codex/responses")) {
+      providerBody = JSON.parse(init.body);
+      return {
+        ok: true,
+        status: 200,
+        body: null,
+        text: async () => JSON.stringify({ output_text: "ok" })
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  process.env.CODEX_REFRESH_TOKEN = "refresh-token";
+  process.env.CODEX_REFRESH_TOKEN_FILE = "/dev/null";
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalRefreshToken === undefined) delete process.env.CODEX_REFRESH_TOKEN;
+    else process.env.CODEX_REFRESH_TOKEN = originalRefreshToken;
+    if (originalRefreshFile === undefined) delete process.env.CODEX_REFRESH_TOKEN_FILE;
+    else process.env.CODEX_REFRESH_TOKEN_FILE = originalRefreshFile;
+  });
+
+  const file = (id) => ({
+    id,
+    name: `${id}.png`,
+    mimetype: "image/png",
+    url_private_download: `https://files.test/${id}`
+  });
+  const older = {
+    channel: "D1",
+    ts: "100.000001",
+    text: "older request",
+    user: "user",
+    files: [file("older-image")]
+  };
+  const event = {
+    channel: "D1",
+    channel_type: "im",
+    ts: "200.000001",
+    text: "current request",
+    user: "user",
+    files: [file("current-image")]
+  };
+  const client = {
+    conversations: {
+      history: async () => ({
+        messages: [event, older],
+        response_metadata: { next_cursor: "" }
+      })
+    }
+  };
+
+  const context = await buildSlackContext(client, event, {
+    botUserId: "bot",
+    botToken: "xoxb-test",
+    maxContextBytes: 20_000,
+    withRetry: async (action) => action()
+  });
+  await createAiResponse(context, { model: "gpt-5", emptyRetryCount: 0 });
+
+  assert.deepEqual(providerBody.input.map(({ role }) => role), [
+    "user", "assistant", "user", "assistant", "user"
+  ]);
+  assert.equal(providerBody.input[0].content, "[APP_CONTEXT_PROTOCOL_START]");
+  assert.equal(providerBody.input[1].content, "[APP_ORIGINAL_USER_TURN_FOLLOWS]");
+  assert.equal(providerBody.input[3].content, "[APP_ORIGINAL_USER_TURN_FOLLOWS]");
+  assert.deepEqual(providerBody.input[2].content.map((part) => part.type), [
+    "input_text", "input_image"
+  ]);
+  assert.deepEqual(providerBody.input[4].content.map((part) => part.type), [
+    "input_text", "input_image"
+  ]);
+  assert.equal(
+    providerBody.input[2].content[1].image_url,
+    `data:image/png;base64,${Buffer.from("older-image").toString("base64")}`
+  );
+  assert.equal(
+    providerBody.input[4].content[1].image_url,
+    `data:image/png;base64,${Buffer.from("current-image").toString("base64")}`
+  );
 });

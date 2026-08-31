@@ -1,3 +1,11 @@
+export class CurrentUserImageLoadError extends Error {
+  constructor() {
+    super("Current user image-only request could not load any supported images");
+    this.name = "CurrentUserImageLoadError";
+    this.code = "CURRENT_USER_IMAGE_LOAD_FAILED";
+  }
+}
+
 export async function collectRecentContext(candidates, maxContextBytes, materialize) {
   const selected = [];
   let usedBytes = 0;
@@ -20,20 +28,7 @@ export async function collectRecentContext(candidates, maxContextBytes, material
   return selected.reverse();
 }
 
-export async function attachImagesToLastUser(context, sources, listImages, loadImage) {
-  const imageUrls = [];
-  for (const source of sources) {
-    for (const image of listImages(source)) {
-      const dataUrl = await loadImage(image);
-      if (dataUrl) {
-        imageUrls.push(dataUrl);
-      }
-    }
-  }
-  if (imageUrls.length === 0) {
-    return context;
-  }
-
+export async function attachImagesToUserTurns(context, sources, listImages, loadImage) {
   let lastUserIndex = -1;
   for (let index = context.length - 1; index >= 0; index--) {
     if (context[index].role === "user") {
@@ -41,19 +36,47 @@ export async function attachImagesToLastUser(context, sources, listImages, loadI
       break;
     }
   }
-  if (lastUserIndex === -1) {
-    return context;
-  }
+  const enriched = [];
+  for (let index = 0; index < context.length; index++) {
+    const message = context[index];
+    const originalContent = message.content;
+    const copiedContent = Array.isArray(originalContent)
+      ? originalContent.map((part) => ({ ...part }))
+      : originalContent;
 
-  const enriched = [...context];
-  const parts = [];
-  const text = context[lastUserIndex].content;
-  if (typeof text === "string" && text.trim()) {
-    parts.push({ type: "input_text", text });
+    if (message.role !== "user") {
+      enriched.push({ ...message, content: copiedContent });
+      continue;
+    }
+
+    const imageUrls = [];
+    for (const image of listImages(sources[index])) {
+      const dataUrl = await loadImage(image);
+      if (dataUrl) {
+        imageUrls.push(dataUrl);
+      }
+    }
+
+    if (imageUrls.length === 0) {
+      const hasContent = Array.isArray(copiedContent)
+        ? copiedContent.length > 0
+        : typeof copiedContent === "string" && copiedContent.trim();
+      if (hasContent) {
+        enriched.push({ ...message, content: copiedContent });
+      } else if (index === lastUserIndex) {
+        throw new CurrentUserImageLoadError();
+      }
+      continue;
+    }
+
+    const parts = Array.isArray(copiedContent) ? copiedContent : [];
+    if (typeof copiedContent === "string" && copiedContent.trim()) {
+      parts.push({ type: "input_text", text: copiedContent });
+    }
+    for (const imageUrl of imageUrls) {
+      parts.push({ type: "input_image", image_url: imageUrl });
+    }
+    enriched.push({ ...message, content: parts });
   }
-  for (const imageUrl of imageUrls) {
-    parts.push({ type: "input_image", image_url: imageUrl });
-  }
-  enriched[lastUserIndex] = { role: "user", content: parts };
   return enriched;
 }

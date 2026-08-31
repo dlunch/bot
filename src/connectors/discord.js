@@ -1,7 +1,11 @@
 import { AttachmentBuilder, Client, EmbedBuilder, GatewayIntentBits, Partials } from "discord.js";
 import { createAiResponse } from "../ai.js";
 import { isTextLike, fetchTextAttachmentBlock } from "./attachments.js";
-import { attachImagesToLastUser, collectRecentContext } from "./context.js";
+import {
+  attachImagesToUserTurns,
+  collectRecentContext,
+  CurrentUserImageLoadError
+} from "./context.js";
 import { markdownChunk } from "./markdown-chunks.js";
 
 /**
@@ -307,10 +311,10 @@ export async function* collectDiscordThreadCandidates(message, botUserId) {
 
 function hasDiscordImageAttachment(message) {
   for (const attachment of message?.attachments?.values?.() || []) {
-    if (
-      typeof attachment?.contentType === "string" &&
-      attachment.contentType.startsWith("image/")
-    ) {
+    const mediaType = typeof attachment?.contentType === "string"
+      ? attachment.contentType.split(";", 1)[0].trim().toLowerCase()
+      : "";
+    if (mediaType.startsWith("image/")) {
       return true;
     }
   }
@@ -335,13 +339,14 @@ export async function materializeDiscordMessage(message, botUserId) {
     if (embed?.description) embedTexts.push(embed.description);
   }
 
+  const role = message.author?.id === botUserId ? "assistant" : "user";
   const content = [baseText, ...embedTexts].filter(Boolean).join("\n").trim();
   const blocks = [];
   for (const attachment of message?.attachments?.values?.() || []) {
-    if (
-      typeof attachment?.contentType === "string" &&
-      attachment.contentType.startsWith("image/")
-    ) {
+    const mediaType = typeof attachment?.contentType === "string"
+      ? attachment.contentType.split(";", 1)[0].trim().toLowerCase()
+      : "";
+    if (mediaType.startsWith("image/")) {
       continue;
     }
     if (!isTextLike(attachment?.name, attachment?.contentType)) {
@@ -357,25 +362,44 @@ export async function materializeDiscordMessage(message, botUserId) {
   }
 
   const finalContent = [content, ...blocks].filter(Boolean).join("\n\n");
+  if (!finalContent && role === "assistant") {
+    return null;
+  }
   if (!finalContent && !hasDiscordImageAttachment(message)) {
     return null;
   }
   return {
     source: message,
-    role: message.author?.id === botUserId ? "assistant" : "user",
+    role,
     content: finalContent
   };
 }
 
-async function fetchDiscordImageAsDataUrl(attachment) {
+const supportedDiscordImageMediaTypes = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp"
+]);
+
+function listDiscordImages(message) {
+  const images = [];
+  for (const attachment of message.attachments.values()) {
+    const mediaType = typeof attachment?.contentType === "string"
+      ? attachment.contentType.split(";", 1)[0].trim().toLowerCase()
+      : "";
+    if (supportedDiscordImageMediaTypes.has(mediaType)) {
+      images.push({ source: attachment, mediaType });
+    }
+  }
+  return images;
+}
+
+async function fetchDiscordImageAsDataUrl(candidate) {
   const maxImageBytes = 5 * 1024 * 1024;
-  const contentType = attachment?.contentType;
+  const attachment = candidate.source;
   const attachmentUrl = attachment?.url;
-  if (
-    !attachmentUrl ||
-    typeof contentType !== "string" ||
-    !contentType.startsWith("image/")
-  ) {
+  if (!attachmentUrl) {
     return null;
   }
   try {
@@ -391,7 +415,7 @@ async function fetchDiscordImageAsDataUrl(attachment) {
       );
       return null;
     }
-    return `data:${contentType};base64,${Buffer.from(bytes).toString("base64")}`;
+    return `data:${candidate.mediaType};base64,${Buffer.from(bytes).toString("base64")}`;
   } catch (error) {
     console.warn(`[discord][image_fetch] failed id=${attachment?.id}`, error);
     return null;
@@ -412,10 +436,10 @@ export async function buildDiscordContext(message, botUserId, maxContextBytes) {
   );
   const context = selected.map(({ role, content }) => ({ role, content }));
 
-  return await attachImagesToLastUser(
+  return await attachImagesToUserTurns(
     context,
     selected.map(({ source }) => source),
-    (source) => source?.attachments?.values?.() || [],
+    listDiscordImages,
     fetchDiscordImageAsDataUrl
   );
 }
@@ -841,6 +865,9 @@ export async function startDiscordBot(config, options) {
       }
     } catch (error) {
       console.error("[discord][message] error", error);
+      const errorMessage = error instanceof CurrentUserImageLoadError
+        ? "현재 요청의 이미지를 불러올 수 없어요. JPEG, PNG, GIF 또는 WebP 이미지를 다시 첨부해 주세요."
+        : "에러가 발생했습니다. 잠시 후 다시 시도해주세요.";
       if (collectedFiles.length > 0) {
         console.error(
           `[discord] dropped ${collectedFiles.length} partial files due to stream error`
@@ -853,14 +880,16 @@ export async function startDiscordBot(config, options) {
       }
       try {
         if (replyMessage) {
-          const errorSuffix = "\n\n⚠️ 출력 중 에러가 발생했습니다.";
+          const errorSuffix = error instanceof CurrentUserImageLoadError
+            ? `\n\n⚠️ ${errorMessage}`
+            : "\n\n⚠️ 출력 중 에러가 발생했습니다.";
           let errorText;
           const currentStreamedText = streamedText.slice(currentMsgOffset);
           if (currentStreamedText.trim()) {
             const maxContent = discordMaxLength - errorSuffix.length;
             errorText = currentStreamedText.trim().slice(0, maxContent) + errorSuffix;
           } else {
-            errorText = "에러가 발생했습니다. 잠시 후 다시 시도해주세요.";
+            errorText = errorMessage;
           }
           try {
             await replyMessage.edit(errorText);
@@ -872,11 +901,11 @@ export async function startDiscordBot(config, options) {
         } else {
           if (inThread) {
             await message.channel.send({
-              content: "에러가 발생했습니다. 잠시 후 다시 시도해주세요.",
+              content: errorMessage,
               allowedMentions: { parse: [] }
             });
           } else {
-            await message.reply("에러가 발생했습니다. 잠시 후 다시 시도해주세요.");
+            await message.reply(errorMessage);
           }
         }
       } catch (innerError) {
