@@ -3,8 +3,12 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import { createAiResponse, __testing__ } from "../src/ai.js";
+import { __testing__ as codexAuthTesting } from "../src/codex-auth.js";
 
 const {
   parseCodexSseStream,
@@ -62,42 +66,54 @@ function installFetchMock(handler) {
 }
 
 /** Install a stubbed Codex auth state (bypasses token refresh). */
-function installCodexAuth() {
+function jwtWithClaims(claims = {}) {
+  return [
+    Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url"),
+    Buffer.from(
+      JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600, ...claims })
+    ).toString("base64url"),
+    "test-signature"
+  ].join(".");
+}
+
+function installCodexAuth({ accessToken = jwtWithClaims(), refreshToken = "stub-refresh-token" } = {}) {
+  const prevAuthFile = process.env.CODEX_AUTH_FILE;
+  const prevAccessTok = process.env.CODEX_ACCESS_TOKEN;
   const prevRefreshTok = process.env.CODEX_REFRESH_TOKEN;
-  const prevRefreshFile = process.env.CODEX_REFRESH_TOKEN_FILE;
-  // Setting refresh token satisfies getCodexAuthState without reading any file.
-  process.env.CODEX_REFRESH_TOKEN = "stub-refresh-token";
-  // Direct token-file reads to a path that won't resolve.
-  process.env.CODEX_REFRESH_TOKEN_FILE = "/tmp/__nonexistent-codex-refresh-token__";
+  const directory = mkdtempSync(path.join(tmpdir(), "bot-ai-auth-"));
+  const file = path.join(directory, "auth.json");
+  writeFileSync(
+    file,
+    `${JSON.stringify({
+      auth_mode: "chatgpt",
+      tokens: { access_token: accessToken, refresh_token: refreshToken }
+    }, null, 2)}\n`,
+    { mode: 0o600 }
+  );
+  process.env.CODEX_AUTH_FILE = file;
+  delete process.env.CODEX_ACCESS_TOKEN;
+  delete process.env.CODEX_REFRESH_TOKEN;
+  codexAuthTesting.reset();
   return {
+    file,
+    accessToken,
+    refreshToken,
     restore() {
+      codexAuthTesting.reset();
+      if (prevAuthFile === undefined) delete process.env.CODEX_AUTH_FILE;
+      else process.env.CODEX_AUTH_FILE = prevAuthFile;
+      if (prevAccessTok === undefined) delete process.env.CODEX_ACCESS_TOKEN;
+      else process.env.CODEX_ACCESS_TOKEN = prevAccessTok;
       if (prevRefreshTok === undefined) delete process.env.CODEX_REFRESH_TOKEN;
       else process.env.CODEX_REFRESH_TOKEN = prevRefreshTok;
-      if (prevRefreshFile === undefined) delete process.env.CODEX_REFRESH_TOKEN_FILE;
-      else process.env.CODEX_REFRESH_TOKEN_FILE = prevRefreshFile;
+      rmSync(directory, { recursive: true, force: true });
     }
   };
 }
 
-/**
- * Fetch handler that:
- *  - Responds to token refresh endpoint with a valid access_token.
- *  - Delegates Codex responses requests to the provided sseString (callable).
- */
+/** Delegates Codex responses requests to the provided sseString (callable). */
 function makeCodexFetchHandler(sseOrFn) {
   return async (url, init) => {
-    if (url.includes("auth.openai.com")) {
-      return {
-        ok: true,
-        status: 200,
-        text: async () =>
-          JSON.stringify({
-            access_token: "fake-access-token",
-            refresh_token: "fake-refresh-token",
-            expires_in: 3600
-          })
-      };
-    }
     if (url.includes("codex/responses")) {
       const sse = typeof sseOrFn === "function" ? await sseOrFn(url, init) : sseOrFn;
       return fakeOkResponseWithStream(sse);
@@ -283,6 +299,618 @@ test("accepts only anchored standard base64 data URLs for Anthropic supported im
 // ---------------------------------------------------------------------------
 // callCodex: body.tools shape tests (A, B, C)
 // ---------------------------------------------------------------------------
+
+test("callCodex reuses a valid access token without refreshing", async () => {
+  const accessToken = jwtWithClaims();
+  const authStub = installCodexAuth({ accessToken });
+  const fetchMock = installFetchMock(async (url, init) => {
+    assert.ok(url.includes("codex/responses"), `unexpected request: ${url}`);
+    assert.equal(init.headers.Authorization, `Bearer ${accessToken}`);
+    return fakeOkResponseWithStream(
+      sseEvent({ type: "response.output_text.delta", delta: "ready" })
+    );
+  });
+
+  try {
+    assert.equal(
+      await callCodex("gpt-5", [{ role: "user", content: "hello" }], "sys", false),
+      "ready"
+    );
+    assert.equal(fetchMock.calls.filter(({ url }) => url.includes("auth.openai.com")).length, 0);
+  } finally {
+    fetchMock.restore();
+    authStub.restore();
+  }
+});
+
+test("callCodex persists a refreshed auth bundle before retrying a 401 response", async () => {
+  const oldAccessToken = jwtWithClaims({ marker: "old" });
+  const nextAccessToken = jwtWithClaims({ marker: "next" });
+  const authStub = installCodexAuth({ accessToken: oldAccessToken, refreshToken: "old-refresh" });
+  let responseCalls = 0;
+  let oauthCalls = 0;
+  const fetchMock = installFetchMock(async (url, init) => {
+    if (url.includes("auth.openai.com")) {
+      oauthCalls++;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          access_token: nextAccessToken,
+          refresh_token: "next-refresh"
+        })
+      };
+    }
+    if (url.includes("codex/responses")) {
+      responseCalls++;
+      if (responseCalls === 1) {
+        assert.equal(init.headers.Authorization, `Bearer ${oldAccessToken}`);
+        return { ok: false, status: 401, text: async () => "unauthorized" };
+      }
+      const stored = JSON.parse(readFileSync(authStub.file, "utf8"));
+      assert.equal(stored.tokens.access_token, nextAccessToken);
+      assert.equal(stored.tokens.refresh_token, "next-refresh");
+      assert.equal(init.headers.Authorization, `Bearer ${nextAccessToken}`);
+      return fakeOkResponseWithStream(
+        sseEvent({ type: "response.output_text.delta", delta: "retried" })
+      );
+    }
+    throw new Error(`unexpected request: ${url}`);
+  });
+
+  try {
+    assert.equal(
+      await callCodex("gpt-5", [{ role: "user", content: "hello" }], "sys", false),
+      "retried"
+    );
+    assert.equal(oauthCalls, 1);
+    assert.equal(responseCalls, 2);
+  } finally {
+    fetchMock.restore();
+    authStub.restore();
+  }
+});
+
+test("callCodex does not refresh again when the retried request is also unauthorized", async () => {
+  const oldAccessToken = jwtWithClaims({ marker: "old" });
+  const nextAccessToken = jwtWithClaims({ marker: "next" });
+  const authStub = installCodexAuth({ accessToken: oldAccessToken, refreshToken: "old-refresh" });
+  let responseCalls = 0;
+  let oauthCalls = 0;
+  const fetchMock = installFetchMock(async (url) => {
+    if (url.includes("auth.openai.com")) {
+      oauthCalls++;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          access_token: nextAccessToken,
+          refresh_token: "next-refresh"
+        })
+      };
+    }
+    responseCalls++;
+    return { ok: false, status: responseCalls === 1 ? 401 : 403, text: async () => "denied" };
+  });
+
+  try {
+    await assert.rejects(
+      callCodex("gpt-5", [{ role: "user", content: "hello" }], "sys", false),
+      /Codex authentication failed \(model=gpt-5, HTTP 403\)/
+    );
+    assert.equal(oauthCalls, 1);
+    assert.equal(responseCalls, 2);
+  } finally {
+    fetchMock.restore();
+    authStub.restore();
+  }
+});
+
+test("callCodex never exposes auth response bodies or header values in errors and debug output", async () => {
+  const previousDebug = process.env.CODEX_SSE_DEBUG;
+  const originalStderrWrite = process.stderr.write;
+  const originalConsole = {
+    error: console.error,
+    log: console.log,
+    warn: console.warn
+  };
+  const diagnostics = [];
+  process.env.CODEX_SSE_DEBUG = "1";
+  process.stderr.write = (chunk) => {
+    diagnostics.push(String(chunk));
+    return true;
+  };
+  console.error = (...args) => diagnostics.push(args.map(String).join(" "));
+  console.log = (...args) => diagnostics.push(args.map(String).join(" "));
+  console.warn = (...args) => diagnostics.push(args.map(String).join(" "));
+
+  try {
+    for (const responseFormat of ["json", "text"]) {
+      diagnostics.length = 0;
+      const oldAccessToken = jwtWithClaims({
+        chatgpt_account_id: "OLD_ACCOUNT_SENTINEL",
+        marker: "OLD_ACCESS_SENTINEL"
+      }).replace(/test-signature$/, "OLD_ACCESS_SENTINEL");
+      const nextAccessToken = jwtWithClaims({ marker: "NEW_ACCESS_SENTINEL" })
+        .replace(/test-signature$/, "NEW_ACCESS_SENTINEL");
+      const sentinels = [
+        oldAccessToken,
+        nextAccessToken,
+        "OLD_REFRESH_SENTINEL",
+        "NEW_REFRESH_SENTINEL",
+        "OLD_ACCOUNT_SENTINEL",
+        "NEW_ACCOUNT_SENTINEL"
+      ];
+      const reflected = sentinels.join("|");
+      const authStub = installCodexAuth({
+        accessToken: oldAccessToken,
+        refreshToken: "OLD_REFRESH_SENTINEL"
+      });
+      let responseCalls = 0;
+      let authBodyReads = 0;
+      const fetchMock = installFetchMock(async (url) => {
+        if (url.includes("auth.openai.com")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({
+              access_token: nextAccessToken,
+              refresh_token: "NEW_REFRESH_SENTINEL",
+              account_id: "NEW_ACCOUNT_SENTINEL"
+            })
+          };
+        }
+        responseCalls++;
+        const status = responseCalls === 1 ? 401 : 403;
+        return {
+          ok: false,
+          status,
+          headers: new Map([
+            ["content-type", responseFormat === "json" ? "application/json" : "text/plain"],
+            ["x-reflected-credentials", reflected]
+          ]),
+          text: async () => {
+            authBodyReads++;
+            return responseFormat === "json"
+              ? JSON.stringify({ error: { message: reflected } })
+              : reflected;
+          }
+        };
+      });
+
+      try {
+        let caught;
+        try {
+          await callCodex("gpt-5", [{ role: "user", content: "hello" }], "sys", false);
+        } catch (error) {
+          caught = error;
+        }
+        assert.ok(caught);
+        assert.equal(caught.message, "Codex authentication failed (model=gpt-5, HTTP 403)");
+        assert.equal(authBodyReads, 0, "authentication error bodies must not be read");
+
+        const observableOutput = [caught.message, caught.stack, ...diagnostics].join("\n");
+        for (const sentinel of sentinels) {
+          assert.equal(
+            observableOutput.includes(sentinel),
+            false,
+            `${responseFormat} authentication failure exposed ${sentinel}`
+          );
+        }
+        assert.match(observableOutput, /header_names=\["content-type"\]/);
+      } finally {
+        fetchMock.restore();
+        authStub.restore();
+      }
+    }
+  } finally {
+    if (previousDebug === undefined) delete process.env.CODEX_SSE_DEBUG;
+    else process.env.CODEX_SSE_DEBUG = previousDebug;
+    process.stderr.write = originalStderrWrite;
+    console.error = originalConsole.error;
+    console.log = originalConsole.log;
+    console.warn = originalConsole.warn;
+  }
+});
+
+test("callCodex never exposes non-ok response bodies or header values in errors and debug output", async () => {
+  const previousDebug = process.env.CODEX_SSE_DEBUG;
+  const originalStderrWrite = process.stderr.write;
+  const originalConsole = {
+    error: console.error,
+    log: console.log,
+    warn: console.warn
+  };
+  const diagnostics = [];
+  process.env.CODEX_SSE_DEBUG = "1";
+  process.stderr.write = (chunk) => {
+    diagnostics.push(String(chunk));
+    return true;
+  };
+  console.error = (...args) => diagnostics.push(args.map(String).join(" "));
+  console.log = (...args) => diagnostics.push(args.map(String).join(" "));
+  console.warn = (...args) => diagnostics.push(args.map(String).join(" "));
+
+  try {
+    for (const status of [400, 429, 500]) {
+      for (const responseFormat of ["json", "text"]) {
+        diagnostics.length = 0;
+        const accessToken = jwtWithClaims({
+          chatgpt_account_id: "NON_OK_ACCOUNT_SENTINEL",
+          marker: "NON_OK_ACCESS_SENTINEL"
+        }).replace(/test-signature$/, "NON_OK_ACCESS_SENTINEL");
+        const sentinels = [
+          accessToken,
+          "NON_OK_REFRESH_SENTINEL",
+          "NON_OK_ACCOUNT_SENTINEL"
+        ];
+        const reflected = sentinels.join("|");
+        const authStub = installCodexAuth({
+          accessToken,
+          refreshToken: "NON_OK_REFRESH_SENTINEL"
+        });
+        let bodyReads = 0;
+        const fetchMock = installFetchMock(async (url) => {
+          assert.ok(url.includes("codex/responses"));
+          return {
+            ok: false,
+            status,
+            headers: new Map([
+              ["content-type", responseFormat === "json" ? "application/json" : "text/plain"],
+              ["x-reflected-credentials", reflected]
+            ]),
+            text: async () => {
+              bodyReads++;
+              return responseFormat === "json"
+                ? JSON.stringify({ error: { message: reflected } })
+                : reflected;
+            }
+          };
+        });
+
+        try {
+          let caught;
+          try {
+            await callCodex("gpt-5", [{ role: "user", content: "hello" }], "sys", false);
+          } catch (error) {
+            caught = error;
+          }
+          assert.ok(caught);
+          assert.equal(
+            caught.message,
+            status === 429
+              ? "[codex] rate limited on model=gpt-5: HTTP 429"
+              : `Codex request failed (model=gpt-5, HTTP ${status})`
+          );
+          assert.equal(bodyReads, 0, "Codex non-ok response bodies must not be read");
+
+          const observableOutput = [caught.message, caught.stack, ...diagnostics].join("\n");
+          for (const sentinel of sentinels) {
+            assert.equal(
+              observableOutput.includes(sentinel),
+              false,
+              `${status} ${responseFormat} response exposed ${sentinel}`
+            );
+          }
+          assert.match(observableOutput, /header_names=\["content-type"\]/);
+        } finally {
+          fetchMock.restore();
+          authStub.restore();
+        }
+      }
+    }
+  } finally {
+    if (previousDebug === undefined) delete process.env.CODEX_SSE_DEBUG;
+    else process.env.CODEX_SSE_DEBUG = previousDebug;
+    process.stderr.write = originalStderrWrite;
+    console.error = originalConsole.error;
+    console.log = originalConsole.log;
+    console.warn = originalConsole.warn;
+  }
+});
+
+test("tool follow-up authentication failures do not expose reflected credentials through console", async () => {
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args.map(String).join(" "));
+
+  try {
+    for (const responseFormat of ["json", "text"]) {
+      warnings.length = 0;
+      const oldAccessToken = jwtWithClaims({
+        chatgpt_account_id: "TOOL_OLD_ACCOUNT_SENTINEL",
+        marker: "TOOL_OLD_ACCESS_SENTINEL"
+      }).replace(/test-signature$/, "TOOL_OLD_ACCESS_SENTINEL");
+      const nextAccessToken = jwtWithClaims({ marker: "TOOL_NEW_ACCESS_SENTINEL" })
+        .replace(/test-signature$/, "TOOL_NEW_ACCESS_SENTINEL");
+      const sentinels = [
+        oldAccessToken,
+        nextAccessToken,
+        "TOOL_OLD_REFRESH_SENTINEL",
+        "TOOL_NEW_REFRESH_SENTINEL",
+        "TOOL_OLD_ACCOUNT_SENTINEL",
+        "TOOL_NEW_ACCOUNT_SENTINEL"
+      ];
+      const reflected = sentinels.join("|");
+      const authStub = installCodexAuth({
+        accessToken: oldAccessToken,
+        refreshToken: "TOOL_OLD_REFRESH_SENTINEL"
+      });
+      let responseCalls = 0;
+      const fetchMock = installFetchMock(async (url) => {
+        if (url.includes("auth.openai.com")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({
+              access_token: nextAccessToken,
+              refresh_token: "TOOL_NEW_REFRESH_SENTINEL",
+              account_id: "TOOL_NEW_ACCOUNT_SENTINEL"
+            })
+          };
+        }
+        responseCalls++;
+        if (responseCalls === 1) {
+          return fakeOkResponseWithStream(
+            sseEvent({ type: "response.output_text.delta", delta: "partial" }) +
+            sseEvent({
+              type: "response.output_item.done",
+              item: {
+                type: "function_call",
+                id: "fc-sensitive",
+                call_id: "call-sensitive",
+                name: "attach_file",
+                arguments: JSON.stringify({ filename: "safe.txt", content: "safe" })
+              }
+            })
+          );
+        }
+        return {
+          ok: false,
+          status: responseCalls === 2 ? 401 : 403,
+          headers: new Map([["x-reflected-credentials", reflected]]),
+          text: async () => responseFormat === "json"
+            ? JSON.stringify({ error: { message: reflected } })
+            : reflected
+        };
+      });
+
+      try {
+        assert.equal(
+          await callCodex(
+            "gpt-5",
+            [{ role: "user", content: "create a file" }],
+            "sys",
+            false,
+            undefined,
+            { onFile: async () => {} }
+          ),
+          "partial"
+        );
+        const consoleOutput = warnings.join("\n");
+        assert.match(consoleOutput, /Codex authentication failed \(model=gpt-5, HTTP 403\)/);
+        for (const sentinel of sentinels) {
+          assert.equal(
+            consoleOutput.includes(sentinel),
+            false,
+            `${responseFormat} authentication failure exposed ${sentinel}`
+          );
+        }
+      } finally {
+        fetchMock.restore();
+        authStub.restore();
+      }
+    }
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test("tool follow-up round uses the latest access token and account snapshot", async () => {
+  const oldAccessToken = jwtWithClaims({ chatgpt_account_id: "old-account" });
+  const nextAccessToken = jwtWithClaims({ marker: "next" });
+  const authStub = installCodexAuth({ accessToken: oldAccessToken, refreshToken: "old-refresh" });
+  let oauthCalls = 0;
+  let primaryCalls = 0;
+  let secondaryCalls = 0;
+  const fetchMock = installFetchMock(async (url, init) => {
+    if (url.includes("auth.openai.com")) {
+      oauthCalls++;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          access_token: nextAccessToken,
+          refresh_token: "next-refresh",
+          account_id: "next-account"
+        })
+      };
+    }
+
+    const body = JSON.parse(init.body);
+    const isSecondary = JSON.stringify(body.input).includes("secondary refresh request");
+    if (isSecondary) {
+      secondaryCalls++;
+      if (secondaryCalls === 1) {
+        assert.equal(init.headers.Authorization, `Bearer ${oldAccessToken}`);
+        return { ok: false, status: 401, text: async () => "unauthorized" };
+      }
+      assert.equal(init.headers.Authorization, `Bearer ${nextAccessToken}`);
+      assert.equal(init.headers["ChatGPT-Account-Id"], "next-account");
+      return fakeOkResponseWithStream(
+        sseEvent({ type: "response.output_text.delta", delta: "refreshed" })
+      );
+    }
+
+    primaryCalls++;
+    if (primaryCalls === 1) {
+      assert.equal(init.headers.Authorization, `Bearer ${oldAccessToken}`);
+      assert.equal(init.headers["ChatGPT-Account-Id"], "old-account");
+      return fakeOkResponseWithStream(
+        sseEvent({ type: "response.output_text.delta", delta: "preparing" }) +
+        sseEvent({
+          type: "response.output_item.done",
+          item: {
+            type: "function_call",
+            id: "fc-refresh",
+            call_id: "call-refresh",
+            name: "attach_file",
+            arguments: JSON.stringify({ filename: "result.txt", content: "content" })
+          }
+        })
+      );
+    }
+    assert.equal(init.headers.Authorization, `Bearer ${nextAccessToken}`);
+    assert.equal(init.headers["ChatGPT-Account-Id"], "next-account");
+    return fakeOkResponseWithStream(
+      sseEvent({ type: "response.output_text.delta", delta: "finished" })
+    );
+  });
+
+  try {
+    const result = await callCodex(
+      "gpt-5",
+      [{ role: "user", content: "primary file request" }],
+      "sys",
+      false,
+      undefined,
+      {
+        onFile: async () => {
+          assert.equal(
+            await callCodex(
+              "gpt-5",
+              [{ role: "user", content: "secondary refresh request" }],
+              "sys",
+              false
+            ),
+            "refreshed"
+          );
+        }
+      }
+    );
+    assert.equal(result, "preparing\nfinished");
+    assert.equal(oauthCalls, 1);
+    assert.equal(primaryCalls, 2);
+    assert.equal(secondaryCalls, 2);
+  } finally {
+    fetchMock.restore();
+    authStub.restore();
+  }
+});
+
+test("an old-token 401 reuses credentials refreshed by another request without another OAuth call", async () => {
+  const oldAccessToken = jwtWithClaims({ chatgpt_account_id: "old-account" });
+  const nextAccessToken = jwtWithClaims({ marker: "next" });
+  const authStub = installCodexAuth({ accessToken: oldAccessToken, refreshToken: "old-refresh" });
+  let oauthCalls = 0;
+  let primaryCalls = 0;
+  let secondaryCalls = 0;
+  let releasePrimary;
+  let markPrimaryStarted;
+  const primaryStarted = new Promise((resolve) => {
+    markPrimaryStarted = resolve;
+  });
+  const fetchMock = installFetchMock(async (url, init) => {
+    if (url.includes("auth.openai.com")) {
+      oauthCalls++;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          access_token: nextAccessToken,
+          refresh_token: "next-refresh",
+          account_id: "next-account"
+        })
+      };
+    }
+
+    const body = JSON.parse(init.body);
+    const isPrimary = JSON.stringify(body.input).includes("delayed primary request");
+    if (isPrimary) {
+      primaryCalls++;
+      if (primaryCalls === 1) {
+        assert.equal(init.headers.Authorization, `Bearer ${oldAccessToken}`);
+        markPrimaryStarted();
+        return new Promise((resolve) => {
+          releasePrimary = () => resolve({
+            ok: false,
+            status: 401,
+            text: async () => "unauthorized"
+          });
+        });
+      }
+      assert.equal(init.headers.Authorization, `Bearer ${nextAccessToken}`);
+      assert.equal(init.headers["ChatGPT-Account-Id"], "next-account");
+      return fakeOkResponseWithStream(
+        sseEvent({ type: "response.output_text.delta", delta: "primary retried" })
+      );
+    }
+
+    secondaryCalls++;
+    if (secondaryCalls === 1) {
+      assert.equal(init.headers.Authorization, `Bearer ${oldAccessToken}`);
+      return { ok: false, status: 401, text: async () => "unauthorized" };
+    }
+    assert.equal(init.headers.Authorization, `Bearer ${nextAccessToken}`);
+    return fakeOkResponseWithStream(
+      sseEvent({ type: "response.output_text.delta", delta: "secondary retried" })
+    );
+  });
+
+  try {
+    const primary = callCodex(
+      "gpt-5",
+      [{ role: "user", content: "delayed primary request" }],
+      "sys",
+      false
+    );
+    await primaryStarted;
+    assert.equal(
+      await callCodex(
+        "gpt-5",
+        [{ role: "user", content: "secondary request" }],
+        "sys",
+        false
+      ),
+      "secondary retried"
+    );
+    releasePrimary();
+    assert.equal(await primary, "primary retried");
+    assert.equal(oauthCalls, 1);
+    assert.equal(primaryCalls, 2);
+    assert.equal(secondaryCalls, 2);
+  } finally {
+    fetchMock.restore();
+    authStub.restore();
+  }
+});
+
+test("callCodex sends the account header only when credentials include an account ID", async () => {
+  for (const accountId of ["account-123", undefined]) {
+    const accessToken = jwtWithClaims(accountId ? { chatgpt_account_id: accountId } : {});
+    const authStub = installCodexAuth({ accessToken });
+    let headers;
+    const fetchMock = installFetchMock(async (url, init) => {
+      assert.ok(url.includes("codex/responses"));
+      headers = init.headers;
+      return fakeOkResponseWithStream(
+        sseEvent({ type: "response.output_text.delta", delta: "ok" })
+      );
+    });
+
+    try {
+      await callCodex("gpt-5", [{ role: "user", content: "hello" }], "sys", false);
+      if (accountId) {
+        assert.equal(headers["ChatGPT-Account-Id"], accountId);
+      } else {
+        assert.equal(Object.hasOwn(headers, "ChatGPT-Account-Id"), false);
+      }
+    } finally {
+      fetchMock.restore();
+      authStub.restore();
+    }
+  }
+});
 
 test("(A) callCodex default body matches codex-rs shape (tools:[], tool_choice, include, cache key)", async () => {
   const authStub = installCodexAuth();

@@ -5,8 +5,11 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 
 import { createAiResponse, __testing__ } from "../src/ai.js";
+import { __testing__ as codexAuthTesting } from "../src/codex-auth.js";
 
 const {
   sanitizeAttachmentFilename,
@@ -56,34 +59,35 @@ function installFetchMock(handler) {
 }
 
 function installCodexAuth() {
+  const prevAuthFile = process.env.CODEX_AUTH_FILE;
+  const prevAccessTok = process.env.CODEX_ACCESS_TOKEN;
   const prevRefreshTok = process.env.CODEX_REFRESH_TOKEN;
-  const prevRefreshFile = process.env.CODEX_REFRESH_TOKEN_FILE;
+  const authFile = `/tmp/bot-ai-attach-${randomUUID()}.json`;
+  const accessToken = [
+    Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url"),
+    "test-signature"
+  ].join(".");
+  process.env.CODEX_AUTH_FILE = authFile;
+  process.env.CODEX_ACCESS_TOKEN = accessToken;
   process.env.CODEX_REFRESH_TOKEN = "stub-refresh-token";
-  process.env.CODEX_REFRESH_TOKEN_FILE = "/tmp/__nonexistent-codex-refresh-token__";
+  codexAuthTesting.reset();
   return {
     restore() {
+      codexAuthTesting.reset();
+      if (prevAuthFile === undefined) delete process.env.CODEX_AUTH_FILE;
+      else process.env.CODEX_AUTH_FILE = prevAuthFile;
+      if (prevAccessTok === undefined) delete process.env.CODEX_ACCESS_TOKEN;
+      else process.env.CODEX_ACCESS_TOKEN = prevAccessTok;
       if (prevRefreshTok === undefined) delete process.env.CODEX_REFRESH_TOKEN;
       else process.env.CODEX_REFRESH_TOKEN = prevRefreshTok;
-      if (prevRefreshFile === undefined) delete process.env.CODEX_REFRESH_TOKEN_FILE;
-      else process.env.CODEX_REFRESH_TOKEN_FILE = prevRefreshFile;
+      rmSync(authFile, { force: true });
     }
   };
 }
 
 function makeCodexFetchHandler(sseOrFn) {
   return async (url, init) => {
-    if (url.includes("auth.openai.com")) {
-      return {
-        ok: true,
-        status: 200,
-        text: async () =>
-          JSON.stringify({
-            access_token: "fake-access-token",
-            refresh_token: "fake-refresh-token",
-            expires_in: 3600
-          })
-      };
-    }
     if (url.includes("codex/responses")) {
       const res = typeof sseOrFn === "function" ? await sseOrFn(url, init) : sseOrFn;
       return typeof res === "string" ? fakeOkResponseWithStream(res) : res;

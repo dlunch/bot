@@ -4,10 +4,11 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import url from "node:url";
 import { stdin as input, stdout as output } from "node:process";
-import { createAiResponse, getAiConfig } from "./ai.js";
+import { createAiResponse } from "./ai.js";
+import { initializeCodexAuth } from "./codex-auth.js";
 
 const servicesFile = path.join(process.cwd(), "config", "services.json");
-const codexAuthFile = path.join(os.homedir(), ".codex", "auth.json");
+export const defaultCliCodexAuthFile = path.join(os.homedir(), ".codex", "auth.json");
 
 function normalizeModels(entry) {
   if (Array.isArray(entry?.models) && entry.models.length > 0) {
@@ -17,66 +18,6 @@ function normalizeModels(entry) {
     return [entry.model.trim()];
   }
   return [];
-}
-
-/**
- * Bootstrap Codex auth from `~/.codex/auth.json` for the CLI.
- *
- * Priority: auth.json.tokens.refresh_token → process.env.CODEX_REFRESH_TOKEN.
- * If auth.json is present, its refresh token takes precedence and we route
- * rotation I/O into a temp file so nothing gets written under the project's
- * cwd. Rotated tokens are synced back into auth.json after each turn via
- * `syncCodexAuth`.
- *
- * Returns `null` when auth.json is missing (ai.js falls back to env).
- */
-export async function loadCodexAuthFromCodexHome() {
-  let content;
-  try {
-    content = await fs.readFile(codexAuthFile, "utf8");
-  } catch (err) {
-    if (err?.code === "ENOENT") {
-      return null;
-    }
-    throw err;
-  }
-
-  const parsed = JSON.parse(content);
-  const refreshToken = parsed?.tokens?.refresh_token;
-  if (typeof refreshToken !== "string" || !refreshToken.trim()) {
-    return null;
-  }
-
-  process.env.CODEX_REFRESH_TOKEN = refreshToken;
-  if (!process.env.CODEX_REFRESH_TOKEN_FILE) {
-    process.env.CODEX_REFRESH_TOKEN_FILE = path.join(
-      os.tmpdir(),
-      `codex-cli-refresh-${process.pid}`
-    );
-  }
-
-  return { parsed, refreshToken };
-}
-
-/**
- * Write the latest in-memory refresh token back into `~/.codex/auth.json`,
- * preserving all other fields. No-op when the token hasn't rotated.
- */
-export async function syncCodexAuth(state) {
-  if (!state) {
-    return;
-  }
-  const current = process.env.CODEX_REFRESH_TOKEN;
-  if (!current || current === state.refreshToken) {
-    return;
-  }
-  const next = {
-    ...state.parsed,
-    tokens: { ...(state.parsed.tokens || {}), refresh_token: current }
-  };
-  await fs.writeFile(codexAuthFile, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
-  state.parsed = next;
-  state.refreshToken = current;
 }
 
 export async function loadCliConfig() {
@@ -180,17 +121,21 @@ export async function saveCliImages(images, opts = {}) {
   return saved;
 }
 
-async function main() {
-  const rl = readline.createInterface({ input, output });
-  const history = [];
-  const codexAuth = await loadCodexAuthFromCodexHome();
-  const aiConfig = getAiConfig();
+export async function main({
+  authFile = defaultCliCodexAuthFile,
+  createInterface = readline.createInterface
+} = {}) {
+  process.env.CODEX_AUTH_FILE = authFile;
+  const codexAuth = await initializeCodexAuth();
   const cliConfig = await loadCliConfig();
+
+  const rl = createInterface({ input, output });
+  const history = [];
 
   console.log("[cli] chat test interface");
   console.log(`[cli] models=${cliConfig.models.join(",")}`);
   console.log(`[cli] name=${cliConfig.name}`);
-  console.log(`[cli] auth_source=${codexAuth ? "codex-home" : aiConfig.codexAuthSource}`);
+  console.log(`[cli] auth_source=${codexAuth.source} configured=${codexAuth.configured}`);
   console.log(`[cli] system_prompt=${cliConfig.systemPrompt ? "service" : "default"}`);
   console.log(`[cli] web_search=${cliConfig.webSearch ? "on" : "off"}`);
   console.log(`[cli] image_generation=${cliConfig.imageGeneration ? "on" : "off"}`);
@@ -292,11 +237,6 @@ async function main() {
       console.error(`assistant> error: ${error.message}\n`);
     }
 
-    try {
-      await syncCodexAuth(codexAuth);
-    } catch (err) {
-      console.error(`[cli] auth.json 동기화 실패: ${err.message}`);
-    }
   }
 
   rl.close();

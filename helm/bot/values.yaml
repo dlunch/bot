@@ -47,8 +47,8 @@ auth:
   existingSecret: ""
 
   codex:
+    accessToken: ""
     refreshToken: ""
-    refreshTokenFile: /app/data/codex-refresh-token
 
   anthropic:
     apiKey: ""

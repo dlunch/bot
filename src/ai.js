@@ -1,13 +1,22 @@
-import fs from "node:fs/promises";
-import path from "node:path";
 import { randomUUID } from "node:crypto";
+import {
+  getCodexAuthConfig,
+  getCodexRequestCredentials,
+  refreshCodexRequestCredentials
+} from "./codex-auth.js";
 
 const codexEndpoint = "https://chatgpt.com/backend-api/codex/responses";
-const refreshEndpoint = "https://auth.openai.com/oauth/token";
-const refreshClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
-const refreshExpirySkewMs = 30_000;
 const codexOriginator = "codex_cli_rs";
 const codexSessionId = randomUUID();
+const codexDebugResponseHeaderNames = new Set([
+  "cf-ray",
+  "content-type",
+  "date",
+  "openai-processing-ms",
+  "server",
+  "x-envoy-upstream-service-time",
+  "x-request-id"
+]);
 
 const anthropicEndpoint = "https://api.anthropic.com/v1/messages";
 const anthropicVersion = "2023-06-01";
@@ -167,36 +176,6 @@ function createAttachFileHandler(onFile) {
   };
 }
 
-let codexAuthState;
-let refreshInFlight;
-
-async function readOptionalFile(filePath) {
-  if (typeof filePath !== "string" || !filePath.trim()) {
-    return undefined;
-  }
-
-  try {
-    const raw = await fs.readFile(filePath.trim(), "utf8");
-    const trimmed = raw.trim();
-    return trimmed ? trimmed : undefined;
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return undefined;
-    }
-    throw error;
-  }
-}
-
-async function writeRefreshTokenFile(filePath, refreshToken) {
-  if (typeof filePath !== "string" || !filePath.trim()) {
-    return;
-  }
-
-  const targetPath = filePath.trim();
-  await fs.mkdir(path.dirname(targetPath), { recursive: true });
-  await fs.writeFile(targetPath, `${refreshToken}\n`, { mode: 0o600 });
-}
-
 function readOptionalEnv(name) {
   if (typeof process.env[name] !== "string") {
     return undefined;
@@ -218,47 +197,6 @@ function parseJson(raw) {
   }
 }
 
-function parseJwtClaims(token) {
-  if (typeof token !== "string") {
-    return undefined;
-  }
-
-  const parts = token.split(".");
-  if (parts.length !== 3 || !parts[1]) {
-    return undefined;
-  }
-
-  try {
-    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-  } catch {
-    return undefined;
-  }
-}
-
-function extractAccountIdFromClaims(claims) {
-  if (!claims || typeof claims !== "object") {
-    return undefined;
-  }
-
-  const embeddedAuth = claims["https://api.openai.com/auth"];
-  return (
-    claims.chatgpt_account_id ||
-    embeddedAuth?.chatgpt_account_id ||
-    (Array.isArray(claims.organizations) && claims.organizations[0]?.id ? claims.organizations[0].id : undefined)
-  );
-}
-
-function extractAccountIdFromTokens(tokens) {
-  const idTokenClaims = parseJwtClaims(tokens?.id_token);
-  const accountIdFromIdToken = extractAccountIdFromClaims(idTokenClaims);
-  if (accountIdFromIdToken) {
-    return accountIdFromIdToken;
-  }
-
-  const accessTokenClaims = parseJwtClaims(tokens?.access_token);
-  return extractAccountIdFromClaims(accessTokenClaims);
-}
-
 function extractErrorDetail(raw, payload) {
   return (
     payload?.detail?.message ||
@@ -271,130 +209,18 @@ function extractErrorDetail(raw, payload) {
   );
 }
 
-function formatRefreshFailure(detail, auth) {
-  if (!detail.includes("refresh token has already been used")) {
-    return detail;
-  }
-
-  if (auth?.refreshTokenFile) {
-    return `${detail} (check that ${auth.refreshTokenFile} is writable and survives pod restarts)`;
-  }
-
-  return `${detail} (the refresh token is rotated on use; persist the latest token via CODEX_REFRESH_TOKEN_FILE or update the secret/env after rotation)`;
-}
-
-async function getCodexAuthState() {
-  if (codexAuthState) {
-    return codexAuthState;
-  }
-
-  const refreshTokenFile = readOptionalEnv("CODEX_REFRESH_TOKEN_FILE") || path.join(process.cwd(), "data", "codex-refresh-token");
-  const refreshToken = (await readOptionalFile(refreshTokenFile)) || readOptionalEnv("CODEX_REFRESH_TOKEN");
-
-  if (!refreshToken) {
-    return undefined;
-  }
-
-  codexAuthState = {
-    accessToken: undefined,
-    refreshToken,
-    refreshTokenFile,
-    accountId: undefined,
-    accessTokenExpiresAt: undefined
-  };
-
-  return codexAuthState;
-}
-
-function shouldRefreshAccessToken(auth) {
-  return Boolean(
-    auth.refreshToken &&
-      (!auth.accessToken ||
-        (typeof auth.accessTokenExpiresAt === "number" && Date.now() >= auth.accessTokenExpiresAt))
-  );
-}
-
-async function refreshCodexAccessToken() {
-  const auth = await getCodexAuthState();
-  if (!auth?.refreshToken) {
-    throw new Error("CODEX_REFRESH_TOKEN is required to refresh access token");
-  }
-
-  if (refreshInFlight) {
-    return refreshInFlight;
-  }
-
-  refreshInFlight = (async () => {
-    const form = new URLSearchParams();
-    form.set("grant_type", "refresh_token");
-    form.set("refresh_token", auth.refreshToken);
-    form.set("client_id", refreshClientId);
-
-    const refreshRes = await fetch(refreshEndpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body: form.toString()
-    });
-
-    const refreshRaw = await refreshRes.text();
-    const refreshPayload = parseJson(refreshRaw);
-    if (!refreshRes.ok) {
-      const detail = extractErrorDetail(refreshRaw, refreshPayload);
-      throw new Error(`Codex token refresh failed: ${formatRefreshFailure(detail, auth)}`);
-    }
-
-    const nextAccessToken =
-      typeof refreshPayload?.access_token === "string" ? refreshPayload.access_token.trim() : "";
-    if (!nextAccessToken) {
-      throw new Error("Codex token refresh failed: access_token missing in refresh response");
-    }
-
-    const nextRefreshToken =
-      typeof refreshPayload?.refresh_token === "string" && refreshPayload.refresh_token.trim()
-        ? refreshPayload.refresh_token.trim()
-        : auth.refreshToken;
-    const nextAccountId = extractAccountIdFromTokens(refreshPayload) || auth.accountId;
-    const expiresInSeconds = Number(refreshPayload?.expires_in);
-    const nextAccessTokenExpiresAt =
-      Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
-        ? Date.now() + expiresInSeconds * 1000 - refreshExpirySkewMs
-        : undefined;
-
-    auth.accessToken = nextAccessToken;
-    auth.refreshToken = nextRefreshToken;
-    auth.accountId = nextAccountId;
-    auth.accessTokenExpiresAt = nextAccessTokenExpiresAt;
-    process.env.CODEX_REFRESH_TOKEN = nextRefreshToken;
-    await writeRefreshTokenFile(auth.refreshTokenFile, nextRefreshToken);
-
-    return auth;
-  })();
-
-  try {
-    return await refreshInFlight;
-  } finally {
-    refreshInFlight = undefined;
-  }
-}
-
-async function requestCodexResponse(body, auth) {
-  if (!auth.accessToken) {
-    throw new Error("access token is unavailable; token refresh may have failed");
-  }
-
+async function requestCodexResponse(body, credentials) {
   const requestId = randomUUID();
   const headers = {
     "Content-Type": "application/json",
     Accept: "text/event-stream",
-    Authorization: `Bearer ${auth.accessToken}`,
+    Authorization: `Bearer ${credentials.accessToken}`,
     originator: codexOriginator,
     session_id: codexSessionId,
     "x-client-request-id": requestId
   };
-  if (auth.accountId) {
-    headers["ChatGPT-Account-Id"] = auth.accountId;
+  if (credentials.accountId) {
+    headers["ChatGPT-Account-Id"] = credentials.accountId;
   }
 
   return fetch(codexEndpoint, {
@@ -960,15 +786,6 @@ function resolveProvider(model, providers) {
 }
 
 async function callCodex(model, context, systemPrompt, webSearch, onDelta, options = {}) {
-  const auth = await getCodexAuthState();
-  if (!auth) {
-    throw new Error("Codex provider is not configured (CODEX_REFRESH_TOKEN missing)");
-  }
-
-  if (shouldRefreshAccessToken(auth)) {
-    await refreshCodexAccessToken();
-  }
-
   const imageGeneration = options?.imageGeneration === true;
   const onImage = typeof options?.onImage === "function" ? options.onImage : undefined;
   const onImageEvent =
@@ -1029,36 +846,48 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
     let roundText;
 
     try {
+      let credentials = await getCodexRequestCredentials();
+      if (!credentials) {
+        throw new Error(
+          "Codex provider is not configured (auth file or bootstrap credentials missing)"
+        );
+      }
+
       if (process.env.CODEX_SSE_DEBUG === "1") {
         process.stderr.write(
           `[codex-sse][request] body=${JSON.stringify(body)}\n`
         );
       }
 
-      let res = await requestCodexResponse(body, auth);
-      if ((res.status === 401 || res.status === 403) && auth.refreshToken) {
-        await refreshCodexAccessToken();
-        res = await requestCodexResponse(body, auth);
+      let res = await requestCodexResponse(body, credentials);
+      if (res.status === 401 || res.status === 403) {
+        credentials = await refreshCodexRequestCredentials(credentials.accessToken);
+        res = await requestCodexResponse(body, credentials);
       }
 
       if (process.env.CODEX_SSE_DEBUG === "1") {
-        const headerDump = {};
-        for (const [k, v] of res.headers?.entries?.() || []) {
-          headerDump[k] = v;
+        const headerNames = [];
+        for (const [name] of res.headers?.entries?.() || []) {
+          const normalizedName = String(name).toLowerCase();
+          if (codexDebugResponseHeaderNames.has(normalizedName)) {
+            headerNames.push(normalizedName);
+          }
         }
         process.stderr.write(
-          `[codex-sse][response] status=${res.status} headers=${JSON.stringify(headerDump)}\n`
+          `[codex-sse][response] status=${res.status} header_names=${JSON.stringify([...new Set(headerNames)])}\n`
         );
       }
 
+      if (res.status === 401 || res.status === 403) {
+        throw new Error(`Codex authentication failed (model=${model}, HTTP ${res.status})`);
+      }
+
       if (res.status === 429) {
-        const raw = await res.text();
-        throw new RateLimitError("codex", model, extractErrorDetail(raw, parseJson(raw)));
+        throw new RateLimitError("codex", model, `HTTP ${res.status}`);
       }
 
       if (!res.ok) {
-        const raw = await res.text();
-        throw new Error(`Codex request failed (model=${model}): ${extractErrorDetail(raw, parseJson(raw))}`);
+        throw new Error(`Codex request failed (model=${model}, HTTP ${res.status})`);
       }
 
       if (res.body) {
@@ -1444,11 +1273,8 @@ export async function createAiResponse(context, options = {}) {
 }
 
 export function getAiConfig() {
-  const refreshTokenFile = readOptionalEnv("CODEX_REFRESH_TOKEN_FILE") || path.join(process.cwd(), "data", "codex-refresh-token");
   return {
-    codexAuthSource: "env+file",
-    refreshTokenFile,
-    hasRefreshToken: Boolean(process.env.CODEX_REFRESH_TOKEN?.trim()),
+    ...getCodexAuthConfig(),
     hasAnthropicKey: Boolean(readOptionalEnv("ANTHROPIC_API_KEY"))
   };
 }

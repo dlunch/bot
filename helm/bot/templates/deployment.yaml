@@ -1,3 +1,15 @@
+{{- if ne (int .Values.replicaCount) 1 }}
+{{- fail "replicaCount must be 1 because the bot and Codex auth bundle require a single writer" }}
+{{- end }}
+{{- if ne (default "" .Values.strategy.type) "Recreate" }}
+{{- fail "strategy.type must be Recreate because rolling pods would overlap the singleton bot and Codex auth writer" }}
+{{- end }}
+{{- $authMountPath := trim (toString .Values.auth.persistence.mountPath) }}
+{{- if or (empty $authMountPath) (not (isAbs $authMountPath)) }}
+{{- fail "auth.persistence.mountPath must be a non-empty absolute path" }}
+{{- end }}
+{{- $authMountPath = clean $authMountPath }}
+{{- $authFile := clean (printf "%s/codex-auth.json" $authMountPath) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,6 +48,12 @@ spec:
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           env:
+            - name: CODEX_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "bot.authSecretName" . }}
+                  key: CODEX_ACCESS_TOKEN
+                  optional: true
             - name: CODEX_REFRESH_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -48,8 +66,8 @@ spec:
                   name: {{ include "bot.authSecretName" . }}
                   key: ANTHROPIC_API_KEY
                   optional: true
-            - name: CODEX_REFRESH_TOKEN_FILE
-              value: {{ .Values.auth.codex.refreshTokenFile | quote }}
+            - name: CODEX_AUTH_FILE
+              value: {{ $authFile | quote }}
             - name: MAX_CONTEXT_BYTES
               value: {{ .Values.env.maxContextBytes | quote }}
             - name: SLACK_STREAM_UPDATE_MS
@@ -62,7 +80,7 @@ spec:
               subPath: services.json
               readOnly: true
             - name: auth-state
-              mountPath: {{ .Values.auth.persistence.mountPath | quote }}
+              mountPath: {{ $authMountPath | quote }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:

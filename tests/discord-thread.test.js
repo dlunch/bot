@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 
 import { Client } from "discord.js";
+import { __testing__ as codexAuthTesting } from "../src/codex-auth.js";
 import { startDiscordBot } from "../src/connectors/discord.js";
 
 async function startDiscordHarness(
@@ -14,8 +17,9 @@ async function startDiscordHarness(
   const originalLogin = Client.prototype.login;
   const originalFetch = globalThis.fetch;
   const originalApiKey = process.env.ANTHROPIC_API_KEY;
+  const originalAuthFile = process.env.CODEX_AUTH_FILE;
+  const originalAccessToken = process.env.CODEX_ACCESS_TOKEN;
   const originalRefreshToken = process.env.CODEX_REFRESH_TOKEN;
-  const originalRefreshTokenFile = process.env.CODEX_REFRESH_TOKEN_FILE;
   const originalLog = console.log;
   const originalWarn = console.warn;
   const originalError = console.error;
@@ -28,8 +32,15 @@ async function startDiscordHarness(
   };
   globalThis.fetch = fetchImpl;
   process.env.ANTHROPIC_API_KEY = "test-key";
+  const authFile = `/tmp/bot-discord-thread-${randomUUID()}.json`;
+  process.env.CODEX_AUTH_FILE = authFile;
+  process.env.CODEX_ACCESS_TOKEN = [
+    Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url"),
+    "test-signature"
+  ].join(".");
   process.env.CODEX_REFRESH_TOKEN = "test-refresh-token";
-  process.env.CODEX_REFRESH_TOKEN_FILE = "/dev/null";
+  codexAuthTesting.reset();
   console.log = () => {};
   console.warn = () => {};
   console.error = () => {};
@@ -52,21 +63,28 @@ async function startDiscordHarness(
     await runtime.stop();
     Client.prototype.login = originalLogin;
     globalThis.fetch = originalFetch;
+    codexAuthTesting.reset();
     if (originalApiKey === undefined) {
       delete process.env.ANTHROPIC_API_KEY;
     } else {
       process.env.ANTHROPIC_API_KEY = originalApiKey;
+    }
+    if (originalAuthFile === undefined) {
+      delete process.env.CODEX_AUTH_FILE;
+    } else {
+      process.env.CODEX_AUTH_FILE = originalAuthFile;
+    }
+    if (originalAccessToken === undefined) {
+      delete process.env.CODEX_ACCESS_TOKEN;
+    } else {
+      process.env.CODEX_ACCESS_TOKEN = originalAccessToken;
     }
     if (originalRefreshToken === undefined) {
       delete process.env.CODEX_REFRESH_TOKEN;
     } else {
       process.env.CODEX_REFRESH_TOKEN = originalRefreshToken;
     }
-    if (originalRefreshTokenFile === undefined) {
-      delete process.env.CODEX_REFRESH_TOKEN_FILE;
-    } else {
-      process.env.CODEX_REFRESH_TOKEN_FILE = originalRefreshTokenFile;
-    }
+    rmSync(authFile, { force: true });
     console.log = originalLog;
     console.warn = originalWarn;
     console.error = originalError;
@@ -453,6 +471,6 @@ test("applies thread and channel reply policy to image progress, placeholder, an
     });
   }
 
-  assert.equal(authFetches, 1);
+  assert.equal(authFetches, 0);
   assert.equal(imageFetches, 2);
 });

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import url from "node:url";
 import { getAiConfig } from "./ai.js";
+import { initializeCodexAuth } from "./codex-auth.js";
 import { startSlackBot } from "./connectors/slack.js";
 import { startDiscordBot } from "./connectors/discord.js";
 import { startIrcBot } from "./connectors/irc.js";
@@ -174,6 +175,64 @@ function assertIrcConfig(config) {
   }
 }
 
+export async function startServices({
+  servicesFile = defaultServicesFile,
+  startSlackBot: startSlack = startSlackBot,
+  startDiscordBot: startDiscord = startDiscordBot,
+  startIrcBot: startIrc = startIrcBot
+} = {}) {
+  const stopHandlers = [];
+
+  const codexAuth = await initializeCodexAuth();
+  const ai = getAiConfig();
+
+  const services = await loadServicesConfig(servicesFile);
+
+  const slackBots = services.slack || [];
+  const discordBots = services.discord || [];
+  const ircBots = services.irc || [];
+
+  if (!slackBots.length && !discordBots.length && !ircBots.length) {
+    throw new Error("No services configured. Add slack/discord/irc entries in config/services.json");
+  }
+
+  const commonOptions = {
+    maxContextBytes,
+    slackStreamUpdateMs,
+    discordStreamUpdateMs
+  };
+
+  for (const slackConfig of slackBots) {
+    assertSlackConfig(slackConfig);
+    const runtime = await startSlack(slackConfig, commonOptions);
+    if (runtime?.stop) {
+      stopHandlers.push(() => runtime.stop());
+    }
+  }
+
+  for (const discordConfig of discordBots) {
+    assertDiscordConfig(discordConfig);
+    const runtime = await startDiscord(discordConfig, commonOptions);
+    if (runtime?.stop) {
+      stopHandlers.push(() => runtime.stop());
+    }
+  }
+
+  for (const ircConfig of ircBots) {
+    assertIrcConfig(ircConfig);
+    const runtime = await startIrc(ircConfig, commonOptions);
+    if (runtime?.stop) {
+      stopHandlers.push(() => runtime.stop());
+    }
+  }
+
+  console.log(
+    `[server] services started slack=${slackBots.length} discord=${discordBots.length} irc=${ircBots.length} codex=${codexAuth.configured} codex_auth_source=${codexAuth.source} anthropic=${ai.hasAnthropicKey}`
+  );
+
+  return { stopHandlers };
+}
+
 async function main() {
   const stopHandlers = [];
   const shutdownTimeoutMs = Number(process.env.SHUTDOWN_TIMEOUT_MS || 10000);
@@ -219,51 +278,8 @@ async function main() {
     void shutdown("SIGINT");
   });
 
-  const ai = getAiConfig();
-
-  const services = await loadServicesConfig();
-
-  const slackBots = services.slack || [];
-  const discordBots = services.discord || [];
-  const ircBots = services.irc || [];
-
-  if (!slackBots.length && !discordBots.length && !ircBots.length) {
-    throw new Error("No services configured. Add slack/discord/irc entries in config/services.json");
-  }
-
-  const commonOptions = {
-    maxContextBytes,
-    slackStreamUpdateMs,
-    discordStreamUpdateMs
-  };
-
-  for (const slackConfig of slackBots) {
-    assertSlackConfig(slackConfig);
-    const runtime = await startSlackBot(slackConfig, commonOptions);
-    if (runtime?.stop) {
-      stopHandlers.push(() => runtime.stop());
-    }
-  }
-
-  for (const discordConfig of discordBots) {
-    assertDiscordConfig(discordConfig);
-    const runtime = await startDiscordBot(discordConfig, commonOptions);
-    if (runtime?.stop) {
-      stopHandlers.push(() => runtime.stop());
-    }
-  }
-
-  for (const ircConfig of ircBots) {
-    assertIrcConfig(ircConfig);
-    const runtime = await startIrcBot(ircConfig, commonOptions);
-    if (runtime?.stop) {
-      stopHandlers.push(() => runtime.stop());
-    }
-  }
-
-  console.log(
-    `[server] services started slack=${slackBots.length} discord=${discordBots.length} irc=${ircBots.length} codex=${ai.hasRefreshToken} anthropic=${ai.hasAnthropicKey}`
-  );
+  const runtime = await startServices();
+  stopHandlers.push(...runtime.stopHandlers);
 }
 
 // Only auto-start when invoked directly (`node src/index.js`). Tests and

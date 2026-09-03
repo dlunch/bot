@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 import SlackBolt from "@slack/bolt";
 import { createAiResponse } from "../src/ai.js";
+import { __testing__ as codexAuthTesting } from "../src/codex-auth.js";
 
 import {
   buildSlackContext,
@@ -583,8 +586,15 @@ test("asks for a supported image again when a Slack image-only DM request cannot
 
 test("carries Slack past and current images through to their delimited Codex request segments", async (t) => {
   const originalFetch = globalThis.fetch;
+  const originalAuthFile = process.env.CODEX_AUTH_FILE;
+  const originalAccessToken = process.env.CODEX_ACCESS_TOKEN;
   const originalRefreshToken = process.env.CODEX_REFRESH_TOKEN;
-  const originalRefreshFile = process.env.CODEX_REFRESH_TOKEN_FILE;
+  const authFile = `/tmp/bot-slack-context-${randomUUID()}.json`;
+  const accessToken = [
+    Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url"),
+    "test-signature"
+  ].join(".");
   let providerBody;
   globalThis.fetch = async (url, init) => {
     if (String(url).startsWith("https://files.test/")) {
@@ -599,7 +609,7 @@ test("carries Slack past and current images through to their delimited Codex req
         ok: true,
         status: 200,
         text: async () => JSON.stringify({
-          access_token: "access-token",
+          access_token: accessToken,
           refresh_token: "next-refresh-token",
           expires_in: 3600
         })
@@ -616,14 +626,20 @@ test("carries Slack past and current images through to their delimited Codex req
     }
     throw new Error(`unexpected fetch: ${url}`);
   };
+  process.env.CODEX_AUTH_FILE = authFile;
+  process.env.CODEX_ACCESS_TOKEN = accessToken;
   process.env.CODEX_REFRESH_TOKEN = "refresh-token";
-  process.env.CODEX_REFRESH_TOKEN_FILE = "/dev/null";
+  codexAuthTesting.reset();
   t.after(() => {
     globalThis.fetch = originalFetch;
+    codexAuthTesting.reset();
+    if (originalAuthFile === undefined) delete process.env.CODEX_AUTH_FILE;
+    else process.env.CODEX_AUTH_FILE = originalAuthFile;
+    if (originalAccessToken === undefined) delete process.env.CODEX_ACCESS_TOKEN;
+    else process.env.CODEX_ACCESS_TOKEN = originalAccessToken;
     if (originalRefreshToken === undefined) delete process.env.CODEX_REFRESH_TOKEN;
     else process.env.CODEX_REFRESH_TOKEN = originalRefreshToken;
-    if (originalRefreshFile === undefined) delete process.env.CODEX_REFRESH_TOKEN_FILE;
-    else process.env.CODEX_REFRESH_TOKEN_FILE = originalRefreshFile;
+    rmSync(authFile, { force: true });
   });
 
   const file = (id) => ({
