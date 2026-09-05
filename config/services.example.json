@@ -2,6 +2,7 @@
   "cli": {
     "name": "dev",
     "model": "gpt-5.3-codex",
+    "reasoningEffort": "medium",
     "systemPrompt": "You are a helpful CLI assistant.",
     "webSearch": false,
     "imageGeneration": true
@@ -12,6 +13,7 @@
       "botToken": "xoxb-your-bot-token",
       "appToken": "xapp-your-app-level-token",
       "model": "gpt-5.3-codex",
+      "reasoningEffort": "medium",
       "systemPrompt": "You are a helpful Slack assistant.",
       "webSearch": false,
       "imageGeneration": false
@@ -22,6 +24,7 @@
       "name": "main",
       "botToken": "your-discord-bot-token",
       "model": "gpt-5.3-codex",
+      "reasoningEffort": "medium",
       "systemPrompt": "You are a helpful Discord assistant.",
       "webSearch": false,
       "imageGeneration": false
@@ -44,6 +47,7 @@
         "password": "your-sasl-password"
       },
       "model": "gpt-5.3-codex",
+      "reasoningEffort": "medium",
       "systemPrompt": "You are a helpful IRC assistant.",
       "webSearch": false
     }

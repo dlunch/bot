@@ -33,6 +33,7 @@ CLI 설정(`config/services.json`의 `cli` 섹션, required):
   "cli": {
     "name": "dev",
     "model": "gpt-5.3-codex",
+    "reasoningEffort": "medium",
     "systemPrompt": "You are a helpful CLI assistant.",
     "webSearch": false,
     "imageGeneration": true
@@ -109,6 +110,14 @@ CLI 명령:
 `config/services.example.json` 예시 파일도 함께 제공합니다.
 각 서비스 항목의 `model`은 필수이며, IRC는 `server`, `nick`, `channels`도 필수입니다.
 서비스별 `systemPrompt`를 넣으면 해당 서비스에만 적용됩니다.
+
+CLI와 Slack/Discord/IRC의 각 설정에 `"reasoningEffort": "high"`를 추가하면 Codex 요청의
+`reasoning.effort`로 전달됩니다. 생략하면 모델 기본값을 사용하며, Anthropic 요청에는
+적용하지 않습니다. 설정값은 `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` 중
+하나여야 합니다. 실제 지원값은 모델마다 다르므로 fallback용 `models` 배열을 사용하는 경우
+각 Codex 모델이 지원하는 값을 선택하세요. 지원값과 기본값은
+[OpenAI 공식 문서](https://developers.openai.com/api/docs/guides/reasoning)를 참고하세요.
+Helm에서도 `config.services.slack[]`, `discord[]`, `irc[]`의 각 항목에 같은 필드를 넣습니다.
 
 ## 3) Slack App 준비
 

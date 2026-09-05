@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { loadServicesConfig, parseMaxContextBytes } from "../src/index.js";
+import { loadCliConfig } from "../src/cli.js";
 
 test("context byte setting defaults to 200000 and accepts positive safe integers", () => {
   assert.equal(parseMaxContextBytes(undefined), 200000);
@@ -34,6 +35,45 @@ async function writeTempServices(payload) {
     }
   };
 }
+
+test("reasoning effort is optional and normalized for every service and the CLI", async (t) => {
+  const { file, cleanup } = await writeTempServices({});
+  t.after(cleanup);
+  for (const effort of [undefined, "none", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+    const entry = { model: "gpt-test", reasoningEffort: effort === undefined ? undefined : ` ${effort} ` };
+    const payload = { cli: entry, slack: [entry], discord: [entry], irc: [entry] };
+    await fs.writeFile(file, JSON.stringify(payload));
+    const config = await loadServicesConfig(file);
+    for (const section of [config.cli, config.slack[0], config.discord[0], config.irc[0]]) {
+      assert.equal(section.reasoningEffort, effort);
+    }
+    const readFile = t.mock.method(fs, "readFile", async () => JSON.stringify(payload));
+    try {
+      assert.equal((await loadCliConfig()).reasoningEffort, effort);
+    } finally {
+      readFile.mock.restore();
+    }
+  }
+});
+
+test("invalid reasoning effort fails config loading instead of using the model default", async (t) => {
+  const { file, cleanup } = await writeTempServices({});
+  t.after(cleanup);
+  for (const value of [null, "", " ", "hgh", "HIGH", true, 1, {}, []]) {
+    const entry = { model: "gpt-test", reasoningEffort: value };
+    for (const service of ["slack", "discord", "irc", "cli"]) {
+      const payload = { [service]: service === "cli" ? entry : [entry] };
+      await fs.writeFile(file, JSON.stringify(payload));
+      await assert.rejects(loadServicesConfig(file), /reasoningEffort must be one of:/);
+    }
+    const readFile = t.mock.method(fs, "readFile", async () => JSON.stringify({ cli: entry }));
+    try {
+      await assert.rejects(loadCliConfig(), /reasoningEffort must be one of:/);
+    } finally {
+      readFile.mock.restore();
+    }
+  }
+});
 
 test("(A) Slack bot config with imageGeneration: true → parsed as true", async (t) => {
   const { file, cleanup } = await writeTempServices({

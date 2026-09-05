@@ -4,7 +4,7 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import url from "node:url";
 import { stdin as input, stdout as output } from "node:process";
-import { createAiResponse } from "./ai.js";
+import { createAiResponse, parseReasoningEffort } from "./ai.js";
 import { initializeCodexAuth } from "./codex-auth.js";
 
 const servicesFile = path.join(process.cwd(), "config", "services.json");
@@ -38,6 +38,7 @@ export async function loadCliConfig() {
   return {
     models,
     providers,
+    reasoningEffort: parseReasoningEffort(cliSection.reasoningEffort),
     systemPrompt:
       typeof cliSection.systemPrompt === "string" && cliSection.systemPrompt.trim()
         ? cliSection.systemPrompt.trim()
@@ -172,6 +173,7 @@ export async function main({
         (await createAiResponse(history, {
           models: cliConfig.models,
           providers: cliConfig.providers,
+          reasoningEffort: cliConfig.reasoningEffort,
           systemPrompt: cliConfig.systemPrompt,
           webSearch: cliConfig.webSearch,
           imageGeneration: imageGenerationEnabled,

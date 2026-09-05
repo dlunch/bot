@@ -323,6 +323,7 @@ export async function startIrcBot(config, options) {
           (context) => createAiResponse(context, {
             models: config.models,
             providers: config.providers,
+            reasoningEffort: config.reasoningEffort,
             webSearch: config.webSearch,
             systemPrompt: config.systemPrompt
           })

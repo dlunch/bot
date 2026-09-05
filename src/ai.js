@@ -176,6 +176,16 @@ function createAttachFileHandler(onFile) {
   };
 }
 
+export function parseReasoningEffort(value) {
+  if (value === undefined) return undefined;
+  const effort = typeof value === "string" ? value.trim() : value;
+  const allowed = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+  if (!allowed.includes(effort)) {
+    throw new Error(`reasoningEffort must be one of: ${allowed.join(", ")}`);
+  }
+  return effort;
+}
+
 function readOptionalEnv(name) {
   if (typeof process.env[name] !== "string") {
     return undefined;
@@ -828,6 +838,9 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
   for (let round = 0; ; round++) {
     const body = {
       model,
+      ...(options.reasoningEffort !== undefined
+        ? { reasoning: { effort: options.reasoningEffort } }
+        : {}),
       instructions: systemPrompt,
       input,
       tools,
@@ -1219,6 +1232,7 @@ export async function createAiResponse(context, options = {}) {
               onFileEvent
             })
           : await callCodex(model, context, systemPrompt, webSearch, onDelta, {
+              reasoningEffort: options.reasoningEffort,
               imageGeneration,
               onImage: wrappedOnImage,
               onImageEvent,

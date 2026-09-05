@@ -1154,6 +1154,28 @@ test("(G) createAiResponse: text-only streaming returns the text string (backwar
   }
 });
 
+test("createAiResponse forwards explicit reasoning effort and omits reasoning when unset", async (t) => {
+  const authStub = installCodexAuth();
+  t.after(() => authStub.restore());
+  const fetchMock = installFetchMock(makeCodexFetchHandler(
+    sseEvent({ type: "response.output_text.delta", delta: "answer" })
+  ));
+  t.after(() => fetchMock.restore());
+
+  for (const effort of [undefined, "none", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+    assert.equal(await createAiResponse([{ role: "user", content: "hello" }], {
+      model: "gpt-test",
+      reasoningEffort: effort
+    }), "answer");
+    const body = JSON.parse(fetchMock.calls.at(-1).init.body);
+    if (effort === undefined) {
+      assert.equal(Object.hasOwn(body, "reasoning"), false);
+    } else {
+      assert.deepEqual(body.reasoning, { effort });
+    }
+  }
+});
+
 test("(H) createAiResponse: image-only response returns '' without retrying (imageCount guards)", async () => {
   const authStub = installCodexAuth();
   let requestCount = 0;
@@ -1419,8 +1441,9 @@ test("(J) createAiResponse: anthropic + imageGeneration=true warns once, ignores
       delta: { type: "text_delta", text: " world" }
     })}\n\n`;
 
-  const fetchMock = installFetchMock(async (url) => {
+  const fetchMock = installFetchMock(async (url, init) => {
     if (url.includes("api.anthropic.com")) {
+      assert.equal(Object.hasOwn(JSON.parse(init.body), "reasoning"), false);
       return fakeOkResponseWithStream(anthropicSse);
     }
     throw new Error(`Unexpected URL: ${url}`);
@@ -1437,6 +1460,7 @@ test("(J) createAiResponse: anthropic + imageGeneration=true warns once, ignores
       {
         model: "claude-sonnet-4-5",
         providers: { anthropic: { models: ["claude-sonnet-4-5"] } },
+        reasoningEffort: "high",
         imageGeneration: true,
         onImage: (...args) => onImageCalls.push(args),
         emptyRetryCount: 0

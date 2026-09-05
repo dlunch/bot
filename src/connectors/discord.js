@@ -722,6 +722,7 @@ export async function startDiscordBot(config, options) {
       const rawAnswer = await createAiResponse(context, {
         models: config.models,
         providers: config.providers,
+        reasoningEffort: config.reasoningEffort,
         webSearch: config.webSearch,
         systemPrompt: config.systemPrompt,
         imageGeneration: imageGenerationEnabled,

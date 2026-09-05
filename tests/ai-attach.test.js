@@ -174,10 +174,11 @@ test("B2 codex: function_call round is followed up with verbatim items + functio
       "sys",
       false,
       (delta, fullText) => deltas.push({ delta, fullText }),
-      { onFile: (file) => files.push(file) }
+      { reasoningEffort: "high", onFile: (file) => files.push(file) }
     );
 
     assert.equal(bodies.length, 2, "exactly one follow-up request");
+    assert.deepEqual(bodies.map((body) => body.reasoning), [{ effort: "high" }, { effort: "high" }]);
 
     // Round 1 request: attach_file tool registered + reasoning include set.
     assert.deepEqual(bodies[0].include, ["reasoning.encrypted_content"]);

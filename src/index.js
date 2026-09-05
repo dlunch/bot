@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import url from "node:url";
-import { getAiConfig } from "./ai.js";
+import { getAiConfig, parseReasoningEffort } from "./ai.js";
 import { initializeCodexAuth } from "./codex-auth.js";
 import { startSlackBot } from "./connectors/slack.js";
 import { startDiscordBot } from "./connectors/discord.js";
@@ -56,6 +56,7 @@ export async function loadServicesConfig(filePath = defaultServicesFile) {
     appToken: entry.appToken,
     models: normalizeModels(entry),
     providers,
+    reasoningEffort: parseReasoningEffort(entry.reasoningEffort),
     webSearch: Boolean(entry.webSearch),
     imageGeneration: parseImageGeneration(entry),
     systemPrompt: normalizeOptionalString(entry.systemPrompt)
@@ -66,6 +67,7 @@ export async function loadServicesConfig(filePath = defaultServicesFile) {
     botToken: entry.botToken,
     models: normalizeModels(entry),
     providers,
+    reasoningEffort: parseReasoningEffort(entry.reasoningEffort),
     webSearch: Boolean(entry.webSearch),
     imageGeneration: parseImageGeneration(entry),
     systemPrompt: normalizeOptionalString(entry.systemPrompt)
@@ -75,6 +77,7 @@ export async function loadServicesConfig(filePath = defaultServicesFile) {
     ? {
         models: normalizeModels(parsed.cli),
         providers,
+        reasoningEffort: parseReasoningEffort(parsed.cli.reasoningEffort),
         webSearch: Boolean(parsed.cli.webSearch),
         imageGeneration: parseImageGeneration(parsed.cli),
         systemPrompt: normalizeOptionalString(parsed.cli.systemPrompt)
@@ -108,6 +111,7 @@ export async function loadServicesConfig(filePath = defaultServicesFile) {
       : null,
     models: normalizeModels(entry),
     providers,
+    reasoningEffort: parseReasoningEffort(entry.reasoningEffort),
     webSearch: Boolean(entry.webSearch),
     // IRC normalizes the field for config-shape consistency but the IRC
     // connector never forwards it to `createAiResponse` — it is an inert
