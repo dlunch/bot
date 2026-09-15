@@ -392,6 +392,55 @@ test("coalesces concurrent refresh requests into one OAuth exchange", async () =
   assert.equal(calls.length, 1);
 });
 
+for (const stalledStage of ["headers", "body"]) {
+  test(`aborts stalled OAuth ${stalledStage}, releases concurrent waiters, and allows the next refresh`, { timeout: 2000 }, async (t) => {
+    const file = await tempAuthFile();
+    const original = authDocument({ access: accessToken(-1) });
+    await writeDocument(file, original);
+    setEnvironment(file);
+    __testing__.setDependencies({ now: () => NOW });
+    await initializeCodexAuth();
+
+    const controller = new AbortController();
+    t.mock.method(AbortSignal, "timeout", (ms) => {
+      assert.equal(ms, 30_000);
+      return controller.signal;
+    });
+    let signalStarted;
+    const started = new Promise((resolve) => { signalStarted = resolve; });
+    const calls = installFetch((url, { signal }) => {
+      const waitForAbort = () => new Promise((resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("SENTINEL-secret")), { once: true });
+        signalStarted();
+      });
+      return stalledStage === "headers"
+        ? waitForAbort()
+        : { ok: true, status: 200, text: waitForAbort };
+    });
+
+    const requests = Array.from({ length: 8 }, () => getCodexRequestCredentials());
+    const settled = Promise.allSettled(requests);
+    await started;
+    assert.equal(calls.length, 1);
+    assert.strictEqual(calls[0].init.signal, controller.signal);
+    controller.abort();
+    for (const result of await settled) {
+      assert.equal(result.status, "rejected");
+      assert.equal(result.reason.message, "Codex token refresh timed out");
+    }
+    assert.deepEqual(JSON.parse(await fs.readFile(file, "utf8")), original);
+
+    t.mock.restoreAll();
+    const nextAccess = accessToken(120_000);
+    const recoveryCalls = installFetch(() => response({
+      access_token: nextAccess, refresh_token: "refresh-rotated"
+    }));
+    assert.deepEqual(await getCodexRequestCredentials(), { accessToken: nextAccess });
+    assert.equal(recoveryCalls.length, 1);
+    assert.equal(JSON.parse(await fs.readFile(file, "utf8")).tokens.refresh_token, "refresh-rotated");
+  });
+}
+
 test("does not refresh twice for sequential rejections of the same old access token", async () => {
   const file = await tempAuthFile();
   const oldAccess = accessToken(60_000);

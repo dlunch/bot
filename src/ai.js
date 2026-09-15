@@ -21,6 +21,7 @@ const codexDebugResponseHeaderNames = new Set([
 const anthropicEndpoint = "https://api.anthropic.com/v1/messages";
 const anthropicVersion = "2023-06-01";
 const anthropicDefaultMaxTokens = 16384;
+const aiIdleTimeoutMs = 300_000;
 
 const defaultSystemPrompt = "You are a concise and helpful assistant. Continue the conversation naturally using the context.";
 const contextProtocolPreamble = "[APP_CONTEXT_PROTOCOL_START]";
@@ -223,6 +224,21 @@ function extractErrorDetail(raw, payload) {
   );
 }
 
+async function requestAiResponse(endpoint, init) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), aiIdleTimeoutMs);
+  try {
+    return await fetch(endpoint, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error("AI request timed out waiting for response headers");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function requestCodexResponse(body, credentials) {
   const requestId = randomUUID();
   const headers = {
@@ -237,7 +253,7 @@ async function requestCodexResponse(body, credentials) {
     headers["ChatGPT-Account-Id"] = credentials.accountId;
   }
 
-  return fetch(codexEndpoint, {
+  return requestAiResponse(codexEndpoint, {
     method: "POST",
     headers,
     body: JSON.stringify(body)
@@ -345,84 +361,80 @@ function extractOutputTextFromEvent(event) {
   return extractOutputText(event);
 }
 
-function parseSseResponse(raw) {
-  let deltaText = "";
-  let fallbackText = "";
-
-  const lines = raw.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) {
-      continue;
-    }
-
-    const data = trimmed.slice(5).trim();
-    if (!data || data === "[DONE]") {
-      continue;
-    }
-
-    let event;
-    try {
-      event = JSON.parse(data);
-    } catch {
-      continue;
-    }
-
-    if (event?.type === "response.output_text.delta" && typeof event.delta === "string") {
-      deltaText += event.delta;
-      continue;
-    }
-
-    const maybeText =
-      event?.type === "response.output_item.done" && event.item?.type === "message"
-        ? extractOutputText({ output: [event.item] })
-        : extractOutputTextFromEvent(event);
-    if (maybeText) {
-      fallbackText = maybeText;
-    }
-  }
-
-  return deltaText.trim() || fallbackText.trim();
-}
-
-async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemCollector, onFileEvent) {
+async function* readSseEvents(stream, debug = false) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let chunkIndex = 0;
+  let timedOut = false;
+  const onTimeout = () => {
+    timedOut = true;
+    // Cancel the pending read, without waiting for the remote peer to close.
+    reader.cancel().catch(() => {});
+  };
+  let timeout = setTimeout(onTimeout, aiIdleTimeoutMs);
+
+  try {
+    let done = false;
+    while (!done) {
+      const result = await reader.read();
+      if (timedOut) throw new Error("AI stream timed out waiting for an event");
+      done = result.done;
+      const chunk = decoder.decode(result.value, { stream: !done });
+      if (debug && !done) {
+        process.stderr.write(
+          `[codex-sse][chunk #${chunkIndex++}] bytes=${result.value.length} text=${JSON.stringify(chunk)}\n`
+        );
+      }
+      buffer += chunk;
+      while (buffer) {
+        const separator = /\r\n\r\n|\n\n|\r\r/.exec(buffer);
+        if (!separator && !done) break;
+        const block = separator ? buffer.slice(0, separator.index) : buffer;
+        buffer = separator ? buffer.slice(separator.index + separator[0].length) : "";
+        if (debug) {
+          process.stderr.write(`[codex-sse][block] ${JSON.stringify(block)}\n`);
+        }
+        const data = block.split(/\r\n|\n|\r/)
+          .map((line) => line.trim())
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trim())
+          .join("\n");
+        if (!data) continue;
+        if (data === "[DONE]") return;
+
+        let event;
+        try {
+          event = JSON.parse(data);
+        } catch {
+          if (debug) {
+            process.stderr.write(`[codex-sse][event_parse_fail] ${JSON.stringify(data)}\n`);
+          }
+          continue;
+        }
+        // Heartbeats are not model progress. Callback time is not network idle time.
+        if (!event?.type || event.type === "ping") continue;
+        clearTimeout(timeout);
+        yield event;
+        timeout = setTimeout(onTimeout, aiIdleTimeoutMs);
+      }
+    }
+  } finally {
+    clearTimeout(timeout);
+    reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemCollector, onFileEvent) {
   let deltaText = "";
   let fallbackText = "";
   const debug = process.env.CODEX_SSE_DEBUG === "1";
-  let chunkIndex = 0;
   const announcedFileCalls = new Set();
 
-  const handleEventBlock = async (block) => {
-    const lines = block.split("\n");
-    const dataLines = [];
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith("data:")) {
-        dataLines.push(trimmed.slice(5).trim());
-      }
-    }
-
-    if (!dataLines.length) {
-      return;
-    }
-
-    const data = dataLines.join("\n");
-    if (!data || data === "[DONE]") {
-      return;
-    }
-
-    let event;
-    try {
-      event = JSON.parse(data);
-    } catch {
-      if (debug) {
-        process.stderr.write(`[codex-sse][event_parse_fail] ${JSON.stringify(data)}\n`);
-      }
-      return;
+  const handleEvent = async (event) => {
+    if (event.type === "response.failed" || event.type === "response.incomplete" || event.type === "error") {
+      throw new Error(`Codex stream failed (${event.type})`);
     }
 
     if (debug) {
@@ -559,58 +571,9 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemC
     }
   };
 
-  const findBlockSeparator = (text) => {
-    // SSE separates events with a blank line which can be \n\n, \r\n\r\n, or \r\r.
-    // Return the earliest match and its length so we can advance past it.
-    let best = -1;
-    let len = 0;
-    const check = (needle) => {
-      const idx = text.indexOf(needle);
-      if (idx !== -1 && (best === -1 || idx < best)) {
-        best = idx;
-        len = needle.length;
-      }
-    };
-    check("\r\n\r\n");
-    check("\n\n");
-    check("\r\r");
-    return best === -1 ? null : { index: best, length: len };
-  };
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    const chunk = decoder.decode(value, { stream: true });
-    if (debug) {
-      process.stderr.write(
-        `[codex-sse][chunk #${chunkIndex++}] bytes=${value.length} text=${JSON.stringify(chunk)}\n`
-      );
-    }
-    buffer += chunk;
-    while (true) {
-      const sep = findBlockSeparator(buffer);
-      if (!sep) {
-        break;
-      }
-
-      const block = buffer.slice(0, sep.index);
-      buffer = buffer.slice(sep.index + sep.length);
-      if (debug) {
-        process.stderr.write(`[codex-sse][block] ${JSON.stringify(block)}\n`);
-      }
-      await handleEventBlock(block);
-    }
-  }
-
-  buffer += decoder.decode();
-  if (buffer.trim()) {
-    if (debug) {
-      process.stderr.write(`[codex-sse][tail] ${JSON.stringify(buffer)}\n`);
-    }
-    await handleEventBlock(buffer);
+  for await (const event of readSseEvents(stream, debug)) {
+    await handleEvent(event);
+    if (event.type === "response.completed") break;
   }
 
   if (debug) {
@@ -623,12 +586,10 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemC
 }
 
 async function parseAnthropicSseStream(stream, onDelta, blockCollector, onFileEvent) {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
   let deltaText = "";
 
   const handleEvent = async (event) => {
+    if (event.type === "error") throw new Error("Anthropic stream failed (error)");
     if (
       blockCollector &&
       event?.type === "content_block_start" &&
@@ -694,59 +655,9 @@ async function parseAnthropicSseStream(stream, onDelta, blockCollector, onFileEv
     }
   };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-    while (true) {
-      const separator = /\r\n\r\n|\n\n|\r\r/.exec(buffer);
-      if (!separator) {
-        break;
-      }
-
-      const block = buffer.slice(0, separator.index);
-      buffer = buffer.slice(separator.index + separator[0].length);
-
-      let data = "";
-      for (const line of block.split(/\r\n|\n|\r/)) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data:")) {
-          data = trimmed.slice(5).trim();
-        }
-      }
-
-      if (!data) {
-        continue;
-      }
-
-      let event;
-      try {
-        event = JSON.parse(data);
-      } catch {
-        continue;
-      }
-
-      await handleEvent(event);
-    }
-  }
-
-  buffer += decoder.decode();
-  if (buffer.trim()) {
-    for (const line of buffer.split(/\r\n|\n|\r/)) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data:")) {
-        continue;
-      }
-      try {
-        const event = JSON.parse(trimmed.slice(5).trim());
-        await handleEvent(event);
-      } catch {
-        continue;
-      }
-    }
+  for await (const event of readSseEvents(stream)) {
+    await handleEvent(event);
+    if (event.type === "message_stop") break;
   }
 
   return deltaText.trim();
@@ -914,7 +825,9 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
       } else {
         // Non-streaming fallback: tool loop unsupported here, return text only.
         const raw = await res.text();
-        const text = raw.includes("data:") ? parseSseResponse(raw) : extractOutputText(parseJson(raw));
+        const text = raw.includes("data:")
+          ? await parseCodexSseStream(new Response(raw).body)
+          : extractOutputText(parseJson(raw));
         if (cumulativeText.length === lenBefore && text) {
           cumulativeText = cumulativeText
             ? cumulativeText + (cumulativeText.endsWith("\n") ? "" : "\n") + text
@@ -1004,7 +917,7 @@ async function callAnthropic(model, context, systemPrompt, onDelta, options = {}
     let roundText;
 
     try {
-      const res = await fetch(anthropicEndpoint, {
+      const res = await requestAiResponse(anthropicEndpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

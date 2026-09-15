@@ -292,15 +292,18 @@ async function requestRefresh(refreshToken) {
   form.set("grant_type", "refresh_token");
   form.set("refresh_token", refreshToken);
   form.set("client_id", refreshClientId);
+  const signal = AbortSignal.timeout(30_000);
 
   let response;
   try {
     response = await dependencies.fetch(refreshEndpoint, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: form.toString()
+      body: form.toString(),
+      signal
     });
   } catch {
+    if (signal.aborted) throw new Error("Codex token refresh timed out");
     throw new Error("Codex token refresh request failed");
   }
 
@@ -308,6 +311,7 @@ async function requestRefresh(refreshToken) {
   try {
     raw = await response.text();
   } catch {
+    if (signal.aborted) throw new Error("Codex token refresh timed out");
     throw new Error(`Codex token refresh failed (HTTP ${response.status})`);
   }
 

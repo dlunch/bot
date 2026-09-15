@@ -6,13 +6,16 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { setImmediate } from "node:timers/promises";
 
 import { createAiResponse, __testing__ } from "../src/ai.js";
 import { __testing__ as codexAuthTesting } from "../src/codex-auth.js";
 
 const {
   parseCodexSseStream,
+  parseAnthropicSseStream,
   callCodex,
+  callAnthropic,
   addOriginalUserTurnProtocol,
   toResponsesInput,
   toAnthropicMessages,
@@ -125,6 +128,125 @@ function makeCodexFetchHandler(sseOrFn) {
 // Small helper to encode an SSE data event line.
 function sseEvent(obj) {
   return `data: ${JSON.stringify(obj)}\n\n`;
+}
+
+test("SSE terminal events settle without EOF and cancel the open connection", { timeout: 2000 }, async (t) => {
+  for (const [parser, terminal, expectedError] of [
+    [parseCodexSseStream, { type: "response.completed", response: { output_text: "answer" } }],
+    [parseCodexSseStream, "[DONE]"],
+    ...["response.failed", "response.incomplete", "error"].map((type) => [
+      parseCodexSseStream, { type, error: { message: "SENTINEL-secret" } }, `Codex stream failed (${type})`
+    ]),
+    [parseAnthropicSseStream, { type: "message_stop" }],
+    [parseAnthropicSseStream, { type: "error", error: { message: "SENTINEL-secret" } }, "Anthropic stream failed (error)"]
+  ]) {
+    await t.test(`${parser.name}: ${terminal.type || terminal}`, async () => {
+      let cancelled = false;
+      const stream = new ReadableStream({
+        start(controller) {
+          const data = terminal === "[DONE]" ? "data: [DONE]\n\n" : sseEvent(terminal);
+          controller.enqueue(new TextEncoder().encode(data + sseEvent({
+            type: "response.output_text.delta", delta: "must not read after terminal"
+          })));
+        },
+        cancel() {
+          cancelled = true;
+          // Cleanup itself must not hold the completed request open.
+          return new Promise(() => {});
+        }
+      });
+      if (expectedError) {
+        await assert.rejects(parser(stream), { message: expectedError });
+      } else {
+        assert.equal(await parser(stream), terminal.type === "response.completed" ? "answer" : "");
+      }
+      assert.equal(cancelled, true);
+      assert.equal(stream.locked, false);
+    });
+  }
+});
+
+for (const parser of [parseCodexSseStream, parseAnthropicSseStream]) {
+  test(`${parser.name}: heartbeats and partial frames cannot keep a stalled stream alive`, { timeout: 2000 }, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let source;
+    let cancelled = false;
+    const stream = new ReadableStream({
+      start(controller) { source = controller; },
+      cancel() { cancelled = true; }
+    });
+    const result = assert.rejects(parser(stream), { message: "AI stream timed out waiting for an event" });
+    t.mock.timers.tick(299_999);
+    source.enqueue(new TextEncoder().encode(': keepalive\n\ndata: {"type":"ping"}\n\ndata: invalid\n\ndata: {"type":'));
+    await setImmediate();
+    assert.equal(cancelled, false);
+    t.mock.timers.tick(1);
+    await result;
+    assert.equal(cancelled, true);
+    assert.equal(stream.locked, false);
+  });
+}
+
+test("SSE idle deadline resets on reasoning progress and excludes callback time", { timeout: 2000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let source;
+  let cancelled = false;
+  const stream = new ReadableStream({
+    start(controller) { source = controller; },
+    cancel() { cancelled = true; }
+  });
+  const result = parseCodexSseStream(stream, () => {
+    t.mock.timers.tick(300_001);
+    assert.equal(cancelled, false, "connector callbacks are outside the network idle deadline");
+  });
+  for (let i = 0; i < 3; i++) {
+    t.mock.timers.tick(299_999);
+    source.enqueue(new TextEncoder().encode(sseEvent({ type: "response.reasoning_summary_text.delta", delta: "thinking" })));
+    await setImmediate();
+    assert.equal(cancelled, false);
+  }
+  source.enqueue(new TextEncoder().encode(
+    sseEvent({ type: "response.output_text.delta", delta: "answer" }) +
+    sseEvent({ type: "response.completed" })
+  ));
+  assert.equal(await result, "answer");
+  assert.equal(cancelled, true);
+});
+
+test("SSE errors in an EOF tail propagate and release the reader", async () => {
+  const stream = streamFromString('data: {"type":"error","error":{"message":"SENTINEL-secret"}}');
+  await assert.rejects(parseAnthropicSseStream(stream), { message: "Anthropic stream failed (error)" });
+  assert.equal(stream.locked, false);
+});
+
+for (const provider of ["codex", "anthropic"]) {
+  test(`${provider}: aborts when response headers never arrive`, { timeout: 2000 }, async (t) => {
+    const auth = installCodexAuth();
+    t.after(() => auth.restore());
+    const previousKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "stub-key";
+    t.after(() => {
+      if (previousKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previousKey;
+    });
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let signalStarted;
+    const started = new Promise((resolve) => { signalStarted = resolve; });
+    const fetchMock = installFetchMock((url, { signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      signalStarted();
+    }));
+    t.after(() => fetchMock.restore());
+    const request = provider === "codex"
+      ? callCodex("gpt-5", [{ role: "user", content: "hi" }], "sys", false)
+      : callAnthropic("claude-test", [{ role: "user", content: "hi" }], "sys");
+    const result = assert.rejects(request, { message: "AI request timed out waiting for response headers" });
+    await started;
+    t.mock.timers.tick(300_000);
+    await result;
+    assert.equal(fetchMock.calls.length, 1);
+    assert.equal(fetchMock.calls[0].init.signal.aborted, true);
+  });
 }
 
 // A valid 1x1 PNG is not required; any non-empty bytes survive the decode.

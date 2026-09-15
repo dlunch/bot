@@ -154,13 +154,26 @@ function codexToolCallRound1Sse() {
 // B2: Codex tool loop
 // ---------------------------------------------------------------------------
 
-test("B2 codex: function_call round is followed up with verbatim items + function_call_output", async () => {
+test("B2 codex: function_call round is followed up with verbatim items + function_call_output", { timeout: 2000 }, async () => {
   const authStub = installCodexAuth();
   const bodies = [];
+  let cancelled = false;
   const fetchMock = installFetchMock(
     makeCodexFetchHandler((url, init) => {
       bodies.push(JSON.parse(init.body));
-      if (bodies.length === 1) return codexToolCallRound1Sse();
+      if (bodies.length === 1) {
+        return {
+          ok: true, status: 200,
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(
+                codexToolCallRound1Sse() + sseEvent({ type: "response.completed" })
+              ));
+            },
+            cancel() { cancelled = true; }
+          })
+        };
+      }
       return sseEvent({ type: "response.output_text.delta", delta: "solution.py attached." });
     })
   );
@@ -178,6 +191,7 @@ test("B2 codex: function_call round is followed up with verbatim items + functio
     );
 
     assert.equal(bodies.length, 2, "exactly one follow-up request");
+    assert.equal(cancelled, true, "tool delivery proceeds without waiting for EOF");
     assert.deepEqual(bodies.map((body) => body.reasoning), [{ effort: "high" }, { effort: "high" }]);
 
     // Round 1 request: attach_file tool registered + reasoning include set.
