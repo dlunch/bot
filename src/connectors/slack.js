@@ -873,6 +873,11 @@ export async function startSlackBot(config, options) {
 
     } catch (error) {
       console.error(`[slack][${source}] error`, error);
+      if (pendingUpdate) {
+        clearTimeout(pendingUpdate);
+        pendingUpdate = null;
+      }
+      await syncInFlight;
       const errorMessage = error instanceof CurrentUserImageLoadError
         ? "현재 요청의 이미지를 불러올 수 없어요. JPEG, PNG, GIF 또는 WebP 이미지를 다시 첨부해 주세요."
         : "에러가 발생했습니다. 잠시 후 다시 시도해주세요.";

@@ -12,7 +12,8 @@ async function startDiscordHarness(
   fetchImpl = async () => {
     throw new Error("AI fetch should not run");
   },
-  configOverrides = {}
+  configOverrides = {},
+  streamUpdateMs = 0
 ) {
   const originalLogin = Client.prototype.login;
   const originalFetch = globalThis.fetch;
@@ -56,7 +57,7 @@ async function startDiscordHarness(
       imageGeneration: false,
       ...configOverrides
     },
-    { maxContextBytes: 200_000, discordStreamUpdateMs: 0 }
+    { maxContextBytes: 200_000, discordStreamUpdateMs: streamUpdateMs }
   );
 
   t.after(async () => {
@@ -120,7 +121,8 @@ function createDiscordMessage({ content = "hello", inThread = true, system = fal
       calls.send.push(payload);
       const sent = {
         id: `sent-${calls.send.length}`,
-        async edit() {},
+        content: payload.content,
+        async edit(content) { this.content = content; },
         async delete() {}
       };
       sentMessages.push(sent);
@@ -147,7 +149,8 @@ function createDiscordMessage({ content = "hello", inThread = true, system = fal
       calls.reply.push(payload);
       const sent = {
         id: `reply-${calls.reply.length}`,
-        async edit() {},
+        content: payload.content,
+        async edit(content) { this.content = content; },
         async delete() {}
       };
       sentMessages.push(sent);
@@ -170,8 +173,9 @@ function anthropicTextResponse(text) {
   };
 }
 
-function anthropicStreamResponse(events) {
-  const body = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+function anthropicStreamResponse(events, terminalType = "message_stop") {
+  const body = [...events, { type: terminalType }]
+    .map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
   return {
     ok: true,
     status: 200,
@@ -183,6 +187,71 @@ function anthropicStreamResponse(events) {
     }),
     text: async () => body
   };
+}
+
+for (const provider of ["codex", "anthropic"]) {
+  test(`${provider} Discord replies preserve the tail across chunk boundaries and report incomplete streams`, { timeout: 2000 }, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let wire;
+    let networkFailure = false;
+    let source;
+    let requests = 0;
+    const listener = await startDiscordHarness(t, async () => {
+      requests++;
+      if (networkFailure) {
+        return new Response(new ReadableStream({
+          start(controller) {
+            source = controller;
+            controller.enqueue(new TextEncoder().encode(wire));
+          }
+        }));
+      }
+      return new Response(wire);
+    }, { providers: { [provider]: { models: ["test-model"] } } }, 60_000);
+    const head = "\n\n\n" + "a".repeat(1997) + "끝";
+    const complete = head + "나요";
+    const delta = (text) => provider === "codex"
+      ? { type: "response.output_text.delta", delta: text }
+      : { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } };
+    const terminal = provider === "codex"
+      ? { type: "response.completed", response: { output: [
+          { type: "message", content: [{ type: "output_text", text: head }] },
+          { type: "message", content: [{ type: "output_text", text: "나" }, { type: "output_text", text: "요" }] }
+        ] } }
+      : { type: "message_stop" };
+
+    for (const inThread of [true, false]) {
+      // Codex's complete snapshot repairs a missing final delta; Anthropic's
+      // final delta waits for the connector's deferred update.
+      const events = [delta(head), ...(provider === "anthropic" ? [delta("나요")] : []), terminal];
+      wire = events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("");
+      const { message, sentMessages } = createDiscordMessage({ inThread });
+      await listener(message);
+      assert.equal(sentMessages.map(sent => sent.content).join(""), complete);
+      assert.equal(sentMessages.length, 2);
+    }
+
+    const requestsBeforeError = requests;
+    wire = `data: ${JSON.stringify(delta("답변이 완료되었"))}\n\ndata: {"type":`;
+    const { message, sentMessages } = createDiscordMessage();
+    await listener(message);
+    t.mock.timers.tick(60_000);
+    assert.equal(requests, requestsBeforeError + 1, "a partial response must not be retried");
+    assert.match(sentMessages[0].content, /^답변이 완료되었\n\n⚠️ 출력 중 에러가 발생했습니다\.$/);
+
+    networkFailure = true;
+    wire = `data: ${JSON.stringify(delta("답변이 완료되었"))}\n\n`;
+    const interrupted = createDiscordMessage();
+    const send = interrupted.message.channel.send;
+    interrupted.message.channel.send = async (payload) => {
+      const reply = await send(payload);
+      source.error(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }));
+      return reply;
+    };
+    await listener(interrupted.message);
+    assert.equal(requests, requestsBeforeError + 2, "even retryable network errors must not restart posted text");
+    assert.match(interrupted.sentMessages[0].content, /⚠️ 출력 중 에러가 발생했습니다\.$/);
+  });
 }
 
 test("ignores Discord system message events before any response work", async (t) => {
@@ -444,7 +513,7 @@ test("applies thread and channel reply policy to image progress, placeholder, an
             revised_prompt: "generated image"
           }
         }
-      ]);
+      ], "response.completed");
     },
     { models: ["image-model"], providers: {}, imageGeneration: true }
   );

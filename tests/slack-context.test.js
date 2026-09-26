@@ -61,7 +61,7 @@ function installSlackFileFetch(t) {
   return calls;
 }
 
-async function startSlackHandlerHarness(t, fetchImpl) {
+async function startSlackHandlerHarness(t, fetchImpl, streamUpdateMs = 0) {
   const { App, webApi } = SlackBolt;
   const originalEvent = App.prototype.event;
   const originalError = App.prototype.error;
@@ -103,7 +103,7 @@ async function startSlackHandlerHarness(t, fetchImpl) {
       systemPrompt: "test",
       imageGeneration: false
     },
-    { maxContextBytes: 200_000, slackStreamUpdateMs: 0 }
+    { maxContextBytes: 200_000, slackStreamUpdateMs: streamUpdateMs }
   );
 
   t.after(async () => {
@@ -122,6 +122,43 @@ async function startSlackHandlerHarness(t, fetchImpl) {
   assert.ok(app);
   return handlers.message;
 }
+
+test("Slack preserves the final deferred delta after a leading-whitespace chunk boundary", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const oldKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "test-key";
+  t.after(() => {
+    if (oldKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = oldKey;
+  });
+  const head = "\n\n\n" + "a".repeat(19997) + "끝";
+  const events = [head, "나요"].map(text => ({
+    type: "content_block_delta", index: 0, delta: { type: "text_delta", text }
+  }));
+  events.push({ type: "message_stop" });
+  const handler = await startSlackHandlerHarness(t, async () => new Response(
+    events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("")
+  ), 60_000);
+  const posted = [];
+  const client = {
+    conversations: { history: async () => ({ messages: [] }) },
+    reactions: { add: async () => {}, remove: async () => {} },
+    chat: {
+      postMessage: async (payload) => {
+        const reply = { ...payload, ts: `reply-${posted.length}` };
+        posted.push(reply);
+        return reply;
+      },
+      update: async ({ ts, text }) => { posted.find(reply => reply.ts === ts).text = text; }
+    }
+  };
+  await handler({
+    event: { channel: "D1", channel_type: "im", ts: "300.000001", text: "test", user: "user" },
+    client, say: async () => {}
+  });
+  assert.equal(posted.length, 2);
+  assert.equal(posted.map(reply => reply.text).join(""), head + "나요");
+});
 
 test("stops direct-message pagination after the first overflowing message", async () => {
   const event = { channel: "D1", ts: "300.000001", text: "new" };

@@ -330,35 +330,24 @@ function toAnthropicMessages(messages) {
 }
 
 function extractOutputText(response) {
-  if (typeof response?.output_text === "string" && response.output_text.trim()) {
-    return response.output_text.trim();
+  if (typeof response?.output_text === "string") {
+    return response.output_text;
   }
 
+  let text = "";
   for (const item of response?.output || []) {
     if (item?.type !== "message") {
       continue;
     }
 
     for (const content of item?.content || []) {
-      if (content?.type === "output_text" && content?.text?.trim()) {
-        return content.text.trim();
+      if (content?.type === "output_text" && typeof content.text === "string") {
+        text += content.text;
       }
     }
   }
 
-  return "";
-}
-
-function extractOutputTextFromEvent(event) {
-  if (typeof event?.output_text === "string" && event.output_text.trim()) {
-    return event.output_text.trim();
-  }
-
-  if (event?.response) {
-    return extractOutputText(event.response);
-  }
-
-  return extractOutputText(event);
+  return text;
 }
 
 async function* readSseEvents(stream, debug = false) {
@@ -429,6 +418,8 @@ async function* readSseEvents(stream, debug = false) {
 async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemCollector, onFileEvent) {
   let deltaText = "";
   let fallbackText = "";
+  let finalText;
+  let completed = false;
   const debug = process.env.CODEX_SSE_DEBUG === "1";
   const announcedFileCalls = new Set();
 
@@ -562,18 +553,31 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemC
       return;
     }
 
-    const maybeText =
-      event?.type === "response.output_item.done" && event.item?.type === "message"
-        ? extractOutputText({ output: [event.item] })
-        : extractOutputTextFromEvent(event);
-    if (maybeText) {
-      fallbackText = maybeText;
+    if (event.type === "response.output_item.done" && event.item?.type === "message") {
+      fallbackText += extractOutputText({ output: [event.item] });
+    }
+    if (event.type === "response.completed" && event.response) {
+      finalText = extractOutputText(event.response);
     }
   };
 
   for await (const event of readSseEvents(stream, debug)) {
     await handleEvent(event);
-    if (event.type === "response.completed") break;
+    if (event.type === "response.completed") {
+      completed = true;
+      break;
+    }
+  }
+  if (!completed) throw new Error("Codex stream ended before response.completed");
+
+  const text = finalText ?? (deltaText || fallbackText);
+  if (!text.startsWith(deltaText)) {
+    throw new Error("Codex final text does not match streamed text");
+  }
+  // Repair a missing suffix through the same callback used by every connector
+  // (including the CLI), without replaying text already delivered.
+  if (onDelta && text.length > deltaText.length) {
+    await onDelta(text.slice(deltaText.length), text);
   }
 
   if (debug) {
@@ -582,11 +586,12 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemC
     );
   }
 
-  return deltaText.trim() || fallbackText.trim();
+  return text;
 }
 
 async function parseAnthropicSseStream(stream, onDelta, blockCollector, onFileEvent) {
   let deltaText = "";
+  let completed = false;
 
   const handleEvent = async (event) => {
     if (event.type === "error") throw new Error("Anthropic stream failed (error)");
@@ -657,10 +662,14 @@ async function parseAnthropicSseStream(stream, onDelta, blockCollector, onFileEv
 
   for await (const event of readSseEvents(stream)) {
     await handleEvent(event);
-    if (event.type === "message_stop") break;
+    if (event.type === "message_stop") {
+      completed = true;
+      break;
+    }
   }
+  if (!completed) throw new Error("Anthropic stream ended before message_stop");
 
-  return deltaText.trim();
+  return deltaText;
 }
 
 function isTransientNetworkError(error) {
@@ -833,17 +842,13 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
             ? cumulativeText + (cumulativeText.endsWith("\n") ? "" : "\n") + text
             : text;
         }
-        return cumulativeText.trim();
+        return cumulativeText;
       }
     } catch (err) {
-      // From round 2 on, round-1 text is already streamed to the connector and
-      // files delivered via onFile — model fallback would corrupt the posted
-      // stream, so end with partial success instead of throwing.
-      if (round === 0) {
-        throw err;
+      if (round > 0) {
+        console.warn(`[ai] attach_file follow-up round ${round + 1} failed`, err);
       }
-      console.warn(`[ai] attach_file follow-up round ${round + 1} failed, returning partial text`, err);
-      return cumulativeText.trim();
+      throw err;
     }
 
     if (cumulativeText.length === lenBefore && roundText) {
@@ -854,11 +859,11 @@ async function callCodex(model, context, systemPrompt, webSearch, onDelta, optio
 
     const functionCalls = (collector?.items || []).filter((it) => it?.type === "function_call");
     if (!handleAttachFile || functionCalls.length === 0) {
-      return cumulativeText.trim();
+      return cumulativeText;
     }
     if (round >= maxToolRounds) {
       console.warn(`[ai] attach_file tool round limit reached (${maxToolRounds}), stopping loop`);
-      return cumulativeText.trim();
+      return cumulativeText;
     }
 
     const outputs = [];
@@ -962,23 +967,19 @@ async function callAnthropic(model, context, systemPrompt, onDelta, options = {}
         const text = (payload?.content || [])
           .filter((b) => b.type === "text")
           .map((b) => b.text)
-          .join("")
-          .trim();
+          .join("");
         if (cumulativeText.length === lenBefore && text) {
           cumulativeText = cumulativeText
             ? cumulativeText + (cumulativeText.endsWith("\n") ? "" : "\n") + text
             : text;
         }
-        return cumulativeText.trim();
+        return cumulativeText;
       }
     } catch (err) {
-      // From round 2 on, round-1 text/files already reached the connector;
-      // model fallback would corrupt the posted stream (see Codex loop).
-      if (round === 0) {
-        throw err;
+      if (round > 0) {
+        console.warn(`[ai] attach_file follow-up round ${round + 1} failed`, err);
       }
-      console.warn(`[ai] attach_file follow-up round ${round + 1} failed, returning partial text`, err);
-      return cumulativeText.trim();
+      throw err;
     }
 
     if (cumulativeText.length === lenBefore && roundText) {
@@ -989,11 +990,11 @@ async function callAnthropic(model, context, systemPrompt, onDelta, options = {}
 
     const toolUses = (collector?.blocks || []).filter((b) => b?.type === "tool_use");
     if (!handleAttachFile || collector?.stopReason !== "tool_use" || toolUses.length === 0) {
-      return cumulativeText.trim();
+      return cumulativeText;
     }
     if (round >= maxToolRounds) {
       console.warn(`[ai] attach_file tool round limit reached (${maxToolRounds}), stopping loop`);
-      return cumulativeText.trim();
+      return cumulativeText;
     }
 
     // blocks is index-assigned and may be sparse — skip holes explicitly.
@@ -1075,6 +1076,11 @@ export async function createAiResponse(context, options = {}) {
   let imageActivity = false;
   let fileCount = 0;
   let fileActivity = false;
+  let textStarted = false;
+  const wrappedOnDelta = (delta, fullText) => {
+    textStarted ||= delta.length > 0;
+    return onDelta?.(delta, fullText);
+  };
   const wrappedOnFile = userOnFile
     ? (file) => {
         fileCount++;
@@ -1144,11 +1150,11 @@ export async function createAiResponse(context, options = {}) {
       fileActivity = false;
       try {
         const result = provider === "anthropic"
-          ? await callAnthropic(model, context, systemPrompt, onDelta, {
+          ? await callAnthropic(model, context, systemPrompt, wrappedOnDelta, {
               onFile: wrappedOnFile,
               onFileEvent
             })
-          : await callCodex(model, context, systemPrompt, webSearch, onDelta, {
+          : await callCodex(model, context, systemPrompt, webSearch, wrappedOnDelta, {
               reasoningEffort: options.reasoningEffort,
               imageGeneration,
               onImage: wrappedOnImage,
@@ -1157,8 +1163,8 @@ export async function createAiResponse(context, options = {}) {
               onFileEvent
             });
 
-        if (result || imageCount > 0 || fileCount > 0) {
-          return result || "";
+        if (result.trim() || imageCount > 0 || fileCount > 0) {
+          return result.trim() ? result : "";
         }
 
         if (imageActivity) {
@@ -1172,6 +1178,9 @@ export async function createAiResponse(context, options = {}) {
         }
       } catch (error) {
         lastError = error;
+        // Retrying after output starts would mix two answers or repeat tools.
+        // Let connectors preserve the partial text and report the failure.
+        if (textStarted || imageCount > 0 || fileCount > 0) throw error;
         if (error instanceof RateLimitError && models.indexOf(model) < models.length - 1) {
           console.warn(`[ai] ${error.message}, falling back to next model`);
           movedToNextModel = true;

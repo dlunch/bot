@@ -34,7 +34,8 @@ function streamFromString(str) {
   });
 }
 
-function fakeOkResponseWithStream(sseString) {
+function fakeOkResponseWithStream(sseString, terminalType = "response.completed") {
+  sseString += sseEvent({ type: terminalType });
   return {
     ok: true,
     status: 200,
@@ -228,14 +229,17 @@ test("B2 codex: function_call round is followed up with verbatim items + functio
   }
 });
 
-test("B2 codex: multi-round text survives without onDelta (M-2b)", async () => {
+test("Codex repairs the final tool-round suffix without replaying earlier text", async () => {
   const authStub = installCodexAuth();
   let calls = 0;
   const fetchMock = installFetchMock(
     makeCodexFetchHandler(() => {
       calls++;
       if (calls === 1) return codexToolCallRound1Sse();
-      return sseEvent({ type: "response.output_text.delta", delta: "done" });
+      return sseEvent({ type: "response.output_text.delta", delta: "don" }) +
+        sseEvent({ type: "response.completed", response: { output: [
+          { type: "message", content: [{ type: "output_text", text: "done" }] }
+        ] } });
     })
   );
 
@@ -351,7 +355,7 @@ test("B2 codex: tool follow-up preserves delta-less output_item.done message tex
   }
 });
 
-test("B2 codex: round-2 failure returns partial text instead of throwing (M-1)", async () => {
+test("Codex follow-up failure propagates without retrying or falling back after file output", async () => {
   const authStub = installCodexAuth();
   let calls = 0;
   const fetchMock = installFetchMock(
@@ -365,19 +369,15 @@ test("B2 codex: round-2 failure returns partial text instead of throwing (M-1)",
   const warn = silenceWarn();
   try {
     const files = [];
-    const result = await callCodex(
-      "gpt-5",
+    await assert.rejects(createAiResponse(
       [{ role: "user", content: "go" }],
-      "sys",
-      false,
-      undefined,
-      { onFile: (f) => files.push(f) }
-    );
-    assert.equal(result, "Here is the script.");
+      { models: ["gpt-5", "gpt-fallback"], onFile: (f) => files.push(f) }
+    ), /rate limited/);
+    assert.equal(calls, 2, "must not restart generation after delivering output");
     assert.equal(files.length, 1, "file from round 1 stays delivered");
     assert.ok(
       warn.warnCalls.some((c) => String(c[0] || "").includes("follow-up round")),
-      "partial-success warn must be logged"
+      "follow-up failure must be logged"
     );
   } finally {
     warn.restore();
@@ -750,7 +750,7 @@ function makeAnthropicFetchHandler(perCall) {
   return async (url, init) => {
     if (url.includes("api.anthropic.com")) {
       const res = await perCall(url, init);
-      return typeof res === "string" ? fakeOkResponseWithStream(res) : res;
+      return typeof res === "string" ? fakeOkResponseWithStream(res, "message_stop") : res;
     }
     throw new Error(`Unexpected URL in mock fetch: ${url}`);
   };
@@ -1173,32 +1173,36 @@ test("B3 anthropic: without onFile the request body has no tools field", async (
   }
 });
 
-test("B3 anthropic: round-2 failure returns partial text instead of throwing (M-1)", async () => {
+test("Anthropic follow-up EOF reports failure without retrying after file output", async () => {
   const keyStub = installAnthropicKey();
   let calls = 0;
   const fetchMock = installFetchMock(
     makeAnthropicFetchHandler(() => {
       calls++;
       if (calls === 1) return anthropicToolCallRound1Sse();
-      return { ok: false, status: 500, text: async () => '{"error":{"message":"boom"}}' };
+      return new Response(sseEvent({
+        type: "content_block_delta", index: 0,
+        delta: { type: "text_delta", text: "Almost finishe" }
+      }));
     })
   );
 
   const warn = silenceWarn();
   try {
     const files = [];
-    const result = await callAnthropic(
-      "claude-sonnet-4-5",
+    await assert.rejects(createAiResponse(
       [{ role: "user", content: "go" }],
-      "sys",
-      undefined,
-      { onFile: (f) => files.push(f) }
-    );
-    assert.equal(result, "Attaching now.");
+      {
+        models: ["claude-sonnet-4-5"],
+        providers: { anthropic: { models: ["claude-sonnet-4-5"] } },
+        onFile: (f) => files.push(f)
+      }
+    ), /stream ended before message_stop/);
+    assert.equal(calls, 2);
     assert.equal(files.length, 1, "file from round 1 stays delivered");
     assert.ok(
       warn.warnCalls.some((c) => String(c[0] || "").includes("follow-up round")),
-      "partial-success warn must be logged"
+      "follow-up failure must be logged"
     );
   } finally {
     warn.restore();

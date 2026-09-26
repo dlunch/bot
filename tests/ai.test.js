@@ -40,7 +40,8 @@ function streamFromString(str) {
  * Build a fake Response-like object compatible with what callCodex awaits.
  * We only need ok/status/body/text.
  */
-function fakeOkResponseWithStream(sseString) {
+function fakeOkResponseWithStream(sseString, terminalType = "response.completed") {
+  sseString += sseEvent({ type: terminalType });
   return {
     ok: true,
     status: 200,
@@ -133,7 +134,7 @@ function sseEvent(obj) {
 test("SSE terminal events settle without EOF and cancel the open connection", { timeout: 2000 }, async (t) => {
   for (const [parser, terminal, expectedError] of [
     [parseCodexSseStream, { type: "response.completed", response: { output_text: "answer" } }],
-    [parseCodexSseStream, "[DONE]"],
+    [parseCodexSseStream, "[DONE]", "Codex stream ended before response.completed"],
     ...["response.failed", "response.incomplete", "error"].map((type) => [
       parseCodexSseStream, { type, error: { message: "SENTINEL-secret" } }, `Codex stream failed (${type})`
     ]),
@@ -798,8 +799,8 @@ test("tool follow-up authentication failures do not expose reflected credentials
       });
 
       try {
-        assert.equal(
-          await callCodex(
+        await assert.rejects(
+          callCodex(
             "gpt-5",
             [{ role: "user", content: "create a file" }],
             "sys",
@@ -807,7 +808,7 @@ test("tool follow-up authentication failures do not expose reflected credentials
             undefined,
             { onFile: async () => {} }
           ),
-          "partial"
+          { message: "Codex authentication failed (model=gpt-5, HTTP 403)" }
         );
         const consoleOutput = warnings.join("\n");
         assert.match(consoleOutput, /Codex authentication failed \(model=gpt-5, HTTP 403\)/);
@@ -1156,7 +1157,7 @@ test("(D) parseCodexSseStream emits onImage with Buffer + metadata on completed 
       }
     });
 
-  const stream = streamFromString(sse);
+  const stream = streamFromString(sse + sseEvent({ type: "response.completed" }));
   const images = [];
   const text = await parseCodexSseStream(stream, undefined, (buf, meta) => {
     images.push({ buf, meta });
@@ -1199,7 +1200,7 @@ test("(E) parseCodexSseStream skips image events with missing/empty result (in-p
     }) +
     sseEvent({ type: "response.output_text.delta", delta: "done" });
 
-  const stream = streamFromString(sse);
+  const stream = streamFromString(sse + sseEvent({ type: "response.completed" }));
   const images = [];
   const text = await parseCodexSseStream(stream, undefined, (buf, meta) => {
     images.push({ buf, meta });
@@ -1232,7 +1233,7 @@ test("(F) parseCodexSseStream tolerates base64 that decodes to an empty buffer",
   console.warn = (...args) => warnCalls.push(args);
 
   try {
-    const stream = streamFromString(sse);
+    const stream = streamFromString(sse + sseEvent({ type: "response.completed" }));
     const images = [];
     const text = await parseCodexSseStream(stream, undefined, (buf, meta) => {
       images.push({ buf, meta });
@@ -1366,7 +1367,7 @@ test("(F2) parseCodexSseStream: onImage throw is isolated and stream keeps parsi
   console.error = (...args) => errCalls.push(args);
 
   try {
-    const stream = streamFromString(sse);
+    const stream = streamFromString(sse + sseEvent({ type: "response.completed" }));
     const text = await parseCodexSseStream(stream, undefined, () => {
       throw new Error("boom from onImage");
     });
@@ -1566,7 +1567,7 @@ test("(J) createAiResponse: anthropic + imageGeneration=true warns once, ignores
   const fetchMock = installFetchMock(async (url, init) => {
     if (url.includes("api.anthropic.com")) {
       assert.equal(Object.hasOwn(JSON.parse(init.body), "reasoning"), false);
-      return fakeOkResponseWithStream(anthropicSse);
+      return fakeOkResponseWithStream(anthropicSse, "message_stop");
     }
     throw new Error(`Unexpected URL: ${url}`);
   });
