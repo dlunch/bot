@@ -237,9 +237,10 @@ test("Codex repairs the final tool-round suffix without replaying earlier text",
       calls++;
       if (calls === 1) return codexToolCallRound1Sse();
       return sseEvent({ type: "response.output_text.delta", delta: "don" }) +
-        sseEvent({ type: "response.completed", response: { output: [
-          { type: "message", content: [{ type: "output_text", text: "done" }] }
-        ] } });
+        sseEvent({ type: "response.output_item.done", item: {
+          type: "message", id: "final-message", content: [{ type: "output_text", text: "done" }]
+        } }) +
+        sseEvent({ type: "response.completed", response: { status: "completed", output: [] } });
     })
   );
 

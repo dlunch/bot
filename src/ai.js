@@ -570,9 +570,11 @@ async function parseCodexSseStream(stream, onDelta, onImage, onImageEvent, itemC
   }
   if (!completed) throw new Error("Codex stream ended before response.completed");
 
-  const text = finalText ?? (deltaText || fallbackText);
-  if (!text.startsWith(deltaText)) {
-    throw new Error("Codex final text does not match streamed text");
+  // Completion snapshots may omit text or contain only part of the output.
+  // Use them only to extend the text already received, never to replace it.
+  let text = deltaText;
+  for (const candidate of [fallbackText, finalText]) {
+    if (candidate?.startsWith(text)) text = candidate;
   }
   // Repair a missing suffix through the same callback used by every connector
   // (including the CLI), without replaying text already delivered.

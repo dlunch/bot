@@ -231,6 +231,24 @@ for (const provider of ["codex", "anthropic"]) {
       assert.equal(sentMessages.length, 2);
     }
 
+    if (provider === "codex") {
+      const item = { type: "message", content: [{ type: "output_text", text: complete }] };
+      const sparseCompletions = [
+        // Metadata-only completion must not erase already streamed text.
+        [delta(complete), { type: "response.completed", response: { status: "completed", output: [] } }],
+        // A partial completion snapshot must not override complete item events.
+        [delta(head), { type: "response.output_item.done", item }, {
+          type: "response.completed", response: { output_text: "끝나요" }
+        }]
+      ];
+      for (const events of sparseCompletions) {
+        wire = events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("");
+        const { message, sentMessages } = createDiscordMessage();
+        await listener(message);
+        assert.equal(sentMessages.map(sent => sent.content).join(""), complete);
+      }
+    }
+
     const requestsBeforeError = requests;
     wire = `data: ${JSON.stringify(delta("답변이 완료되었"))}\n\ndata: {"type":`;
     const { message, sentMessages } = createDiscordMessage();
