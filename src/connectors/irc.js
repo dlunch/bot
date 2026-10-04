@@ -194,53 +194,18 @@ export async function startIrcBot(config, options) {
   let socketBuffer = "";
   let stopRequested = false;
   let joinedChannels = false;
-  let readySettled = false;
+  let connectTimer;
+  let reconnectTimer;
+  let reconnectDelayMs = 1000;
   let capEnded = !saslEnabled;
   let capLsBuffer = "";
   let saslAuthStarted = false;
   let saslChunks = [];
 
   let readyResolve;
-  let readyReject;
-  const readyPromise = new Promise((resolve, reject) => {
+  const readyPromise = new Promise((resolve) => {
     readyResolve = resolve;
-    readyReject = reject;
   });
-
-  const readyTimeout = setTimeout(() => {
-    if (!readySettled) {
-      readySettled = true;
-      readyReject(new Error(`IRC connect timeout after ${connectTimeoutMs}ms`));
-    }
-  }, connectTimeoutMs);
-
-  function resolveReady() {
-    if (readySettled) {
-      return;
-    }
-    readySettled = true;
-    clearTimeout(readyTimeout);
-    readyResolve();
-  }
-
-  function rejectReady(error) {
-    if (readySettled) {
-      return;
-    }
-    readySettled = true;
-    clearTimeout(readyTimeout);
-    readyReject(error);
-  }
-
-  function closeWithError(message) {
-    rejectReady(new Error(message));
-    if (!socket || socket.destroyed) {
-      return;
-    }
-
-    sendRaw(`QUIT :${message}`);
-    socket.end();
-  }
 
   function endCapNegotiation() {
     if (capEnded) {
@@ -259,6 +224,9 @@ export async function startIrcBot(config, options) {
   }
 
   function sendMessage(target, text) {
+    if (!joinedChannels) {
+      return;
+    }
     const normalized = text.replace(/\r?\n/g, " ").trim();
     if (!normalized) {
       return;
@@ -361,6 +329,8 @@ export async function startIrcBot(config, options) {
     }
 
     if (parsed.command === "001") {
+      clearTimeout(connectTimer);
+      reconnectDelayMs = 1000;
       endCapNegotiation();
       if (!joinedChannels) {
         joinedChannels = true;
@@ -368,7 +338,10 @@ export async function startIrcBot(config, options) {
           sendRaw(`JOIN ${channel}`);
         }
       }
-      resolveReady();
+      readyResolve();
+      console.log(
+        `[irc] connected name=${config.name} server=${host}:${port} ssl=${useTls} sasl=${saslEnabled} nick=${currentNick} channels=${channels.length} models=${(config.models || []).join(",")} web_search=${config.webSearch} system_prompt=${config.systemPrompt ? "service" : "default"}`
+      );
       return;
     }
 
@@ -398,7 +371,7 @@ export async function startIrcBot(config, options) {
         const saslSupported = hasCapability(capLsBuffer, "sasl");
         capLsBuffer = "";
         if (!saslSupported) {
-          closeWithError(`IRC server does not support SASL for name=${config.name}`);
+          socket.destroy(new Error(`IRC server does not support SASL for name=${config.name}`));
           return;
         }
 
@@ -418,7 +391,7 @@ export async function startIrcBot(config, options) {
       }
 
       if (subCommand === "NAK" && saslEnabled) {
-        closeWithError(`IRC server rejected SASL capability for name=${config.name}`);
+        socket.destroy(new Error(`IRC server rejected SASL capability for name=${config.name}`));
         return;
       }
 
@@ -448,7 +421,7 @@ export async function startIrcBot(config, options) {
 
     if (["904", "905", "906", "907", "908"].includes(parsed.command)) {
       const detail = parsed.params[parsed.params.length - 1] || "SASL authentication failed";
-      closeWithError(`IRC SASL failed: ${detail}`);
+      socket.destroy(new Error(`IRC SASL failed: ${detail}`));
       return;
     }
 
@@ -463,7 +436,7 @@ export async function startIrcBot(config, options) {
 
     if (parsed.command === "ERROR") {
       const detail = parsed.params[0] || "server error";
-      rejectReady(new Error(`IRC server error: ${detail}`));
+      socket.destroy(new Error(`IRC server error: ${detail}`));
       return;
     }
 
@@ -472,76 +445,84 @@ export async function startIrcBot(config, options) {
     }
   }
 
-  socket = useTls
-    ? tls.connect({
-        host,
-        port,
-        servername: host
-      })
-    : net.createConnection({
-        host,
-        port
-      });
+  function connect() {
+    currentNick = requestedNick;
+    socketBuffer = "";
+    joinedChannels = false;
+    capEnded = !saslEnabled;
+    capLsBuffer = "";
+    saslAuthStarted = false;
+    saslChunks = [];
 
-  socket.setEncoding("utf8");
+    socket = useTls
+      ? tls.connect({
+          host,
+          port,
+          servername: host
+        })
+      : net.createConnection({
+          host,
+          port
+        });
 
-  socket.on("connect", () => {
-    if (config.password) {
-      sendRaw(`PASS ${config.password}`);
-    }
+    connectTimer = setTimeout(() => {
+      socket.destroy(new Error(`IRC connect timeout after ${connectTimeoutMs}ms`));
+    }, connectTimeoutMs);
 
-    if (saslEnabled) {
-      sendRaw("CAP LS 302");
-    }
+    socket.setEncoding("utf8");
 
-    sendRaw(`NICK ${currentNick}`);
-    sendRaw(`USER ${username} 0 * :${realname}`);
-  });
-
-  socket.on("data", (chunk) => {
-    socketBuffer += chunk;
-
-    while (true) {
-      const newlineIndex = socketBuffer.indexOf("\n");
-      if (newlineIndex === -1) {
-        break;
+    socket.on("connect", () => {
+      if (config.password) {
+        sendRaw(`PASS ${config.password}`);
       }
 
-      const line = socketBuffer.slice(0, newlineIndex).replace(/\r$/, "");
-      socketBuffer = socketBuffer.slice(newlineIndex + 1);
-
-      if (!line) {
-        continue;
+      if (saslEnabled) {
+        sendRaw("CAP LS 302");
       }
 
-      handleIrcLine(line);
-    }
-  });
+      sendRaw(`NICK ${currentNick}`);
+      sendRaw(`USER ${username} 0 * :${realname}`);
+    });
 
-  socket.on("error", (error) => {
-    console.error(`[irc][socket_error] name=${config.name}`, error);
-    rejectReady(error);
-  });
+    socket.on("data", (chunk) => {
+      socketBuffer += chunk;
 
-  socket.on("close", () => {
-    if (stopRequested) {
-      return;
-    }
+      while (!socket.destroyed) {
+        const newlineIndex = socketBuffer.indexOf("\n");
+        if (newlineIndex === -1) {
+          break;
+        }
 
-    if (!readySettled) {
-      rejectReady(new Error("IRC connection closed before ready"));
-      return;
-    }
+        const line = socketBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+        socketBuffer = socketBuffer.slice(newlineIndex + 1);
 
-    console.error(`[irc] connection closed unexpectedly name=${config.name}`);
-    process.exit(1);
-  });
+        if (!line) {
+          continue;
+        }
 
+        handleIrcLine(line);
+      }
+    });
+
+    socket.on("error", (error) => {
+      console.error(`[irc][socket_error] name=${config.name}`, error);
+    });
+
+    socket.on("close", () => {
+      clearTimeout(connectTimer);
+      joinedChannels = false;
+      if (stopRequested) {
+        return;
+      }
+
+      console.error(`[irc] connection closed name=${config.name} reconnecting_in_ms=${reconnectDelayMs}`);
+      reconnectTimer = setTimeout(connect, reconnectDelayMs);
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30_000);
+    });
+  }
+
+  connect();
   await readyPromise;
-
-  console.log(
-    `[irc] started name=${config.name} server=${host}:${port} ssl=${useTls} sasl=${saslEnabled} nick=${currentNick} channels=${channels.length} models=${(config.models || []).join(",")} web_search=${config.webSearch} system_prompt=${config.systemPrompt ? "service" : "default"}`
-  );
 
   return {
     async stop() {
@@ -549,6 +530,8 @@ export async function startIrcBot(config, options) {
         return;
       }
       stopRequested = true;
+      clearTimeout(connectTimer);
+      clearTimeout(reconnectTimer);
 
       if (!socket || socket.destroyed) {
         return;
@@ -562,19 +545,20 @@ export async function startIrcBot(config, options) {
             return;
           }
           settled = true;
+          clearTimeout(timeout);
           resolve();
         };
 
-        socket.once("close", finish);
-        sendRaw("QUIT :shutting down");
-        socket.end();
-
-        setTimeout(() => {
+        const timeout = setTimeout(() => {
           if (socket && !socket.destroyed) {
             socket.destroy();
           }
           finish();
         }, 2000);
+
+        socket.once("close", finish);
+        sendRaw("QUIT :shutting down");
+        socket.end();
       });
 
       console.log(`[irc] stopped name=${config.name}`);
